@@ -1,0 +1,39 @@
+# 数据和模型目录
+pretrained/
+projects/
+runs/
+datasets/
+data/
+
+# 开发和临时文件
+.git/
+__pycache__/
+*.pyc
+*.log
+*.pyo
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 虚拟环境
+venv/
+env/
+*.env
+*.venv
+
+# 操作系统文件
+Thumbs.db
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# 打包文件
+dist/
+build/
+*.spec
