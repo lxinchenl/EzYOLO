@@ -11,6 +11,7 @@ __pycache__/
 *.pyc
 *.log
 *.pyo
+*.pt
 
 # IDE配置
 .vscode/

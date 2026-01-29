@@ -87,8 +87,7 @@ class AboutPage(QWidget):
         anti_piracy_text = QTextEdit()
         anti_piracy_text.setReadOnly(True)
         anti_piracy_text.setStyleSheet("background-color: #252526; color: #ffffff; padding: 8px; border-radius: 4px;")
-        anti_piracy_text.setText("任何单位或个人未经授权，不得复制、分发、修改、破解本软件。\n\n" 
-                               "欢迎反馈交流，期待您的建议和反馈。\n\n" )
+        anti_piracy_text.setText("欢迎反馈交流\n\n" )
         layout.addWidget(anti_piracy_text)
         
         return group
