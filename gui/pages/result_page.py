@@ -182,7 +182,7 @@ class ResultPage(QWidget):
         metrics_grid.setSpacing(10)
         
         # 指标标签
-        metrics = ['mAP50', 'mAP75', '精确率', '召回率']
+        metrics = ['mAP50', 'mAP50_95', '精确率', '召回率']
         self.metric_labels = {}
         
         for i, metric in enumerate(metrics):
@@ -235,18 +235,22 @@ class ResultPage(QWidget):
     
     def scan_runs_directory(self):
         """扫描runs目录"""
-        if not self.current_project_id:
-            # 没有设置项目
-            return
+        self.image_list.clear()
         
-        runs_dir = "runs/train"
+        # 递归搜索runs目录下的所有训练结果文件夹
+        runs_dir = "runs"
         
         if not os.path.exists(runs_dir):
-            QMessageBox.warning(self, "提示", "runs/train目录不存在")
+            QMessageBox.warning(self, "提示", "runs目录不存在")
             return
         
-        # 查找与当前项目对应的训练结果
-        projects = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+        # 递归查找所有包含weights文件夹的目录（这些是训练结果目录）
+        projects = []
+        for root, dirs, files in os.walk(runs_dir):
+            if 'weights' in dirs:
+                # 提取目录名（相对于runs目录）
+                rel_path = os.path.relpath(root, runs_dir)
+                projects.append(rel_path)
         
         # 过滤出与当前项目对应的结果（格式为exp_项目ID）
         project_runs = []
@@ -344,14 +348,18 @@ class ResultPage(QWidget):
             QMessageBox.warning(self, "提示", "请先选择一个项目")
             return
         
-        runs_dir = "runs/train"
+        runs_dir = "runs"
         
         if not os.path.exists(runs_dir):
-            QMessageBox.warning(self, "提示", "runs/train目录不存在")
+            QMessageBox.warning(self, "提示", "runs目录不存在")
             return
         
-        # 查找与当前项目对应的训练结果
-        projects = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+        # 递归查找所有包含weights文件夹的目录
+        projects = []
+        for root, dirs, files in os.walk(runs_dir):
+            if 'weights' in dirs:
+                rel_path = os.path.relpath(root, runs_dir)
+                projects.append(rel_path)
         
         # 过滤出与当前项目对应的结果
         project_runs = []
@@ -425,14 +433,18 @@ class ResultPage(QWidget):
             QMessageBox.warning(self, "提示", "请先选择一个项目")
             return
         
-        runs_dir = "runs/train"
+        runs_dir = "runs"
         
         if not os.path.exists(runs_dir):
-            QMessageBox.warning(self, "提示", "runs/train目录不存在")
+            QMessageBox.warning(self, "提示", "runs目录不存在")
             return
         
-        # 查找与当前项目对应的训练结果
-        projects = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+        # 递归查找所有包含weights文件夹的目录
+        projects = []
+        for root, dirs, files in os.walk(runs_dir):
+            if 'weights' in dirs:
+                rel_path = os.path.relpath(root, runs_dir)
+                projects.append(rel_path)
         
         # 过滤出与当前项目对应的结果
         project_runs = []
@@ -481,14 +493,18 @@ class ResultPage(QWidget):
             QMessageBox.warning(self, "提示", "请先选择一个项目")
             return
         
-        runs_dir = "runs/train"
+        runs_dir = "runs"
         
         if not os.path.exists(runs_dir):
-            QMessageBox.warning(self, "提示", "runs/train目录不存在")
+            QMessageBox.warning(self, "提示", "runs目录不存在")
             return
         
-        # 查找与当前项目对应的训练结果
-        projects = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+        # 递归查找所有包含weights文件夹的目录
+        projects = []
+        for root, dirs, files in os.walk(runs_dir):
+            if 'weights' in dirs:
+                rel_path = os.path.relpath(root, runs_dir)
+                projects.append(rel_path)
         
         # 过滤出与当前项目对应的结果
         project_runs = []
@@ -562,13 +578,13 @@ class ResultPage(QWidget):
                 precision = float(last_row.get('metrics/precision(B)', 0))
                 recall = float(last_row.get('metrics/recall(B)', 0))
                 map50 = float(last_row.get('metrics/mAP50(B)', 0))
-                map75 = float(last_row.get('metrics/mAP50-95(B)', 0))
+                map50_95 = float(last_row.get('metrics/mAP50-95(B)', 0))
                 
                 # 更新指标显示
                 if 'mAP50' in self.metric_labels:
                     self.metric_labels['mAP50'].setText(f"{map50:.4f}")
-                if 'mAP75' in self.metric_labels:
-                    self.metric_labels['mAP75'].setText(f"{map75:.4f}")
+                if 'mAP50_95' in self.metric_labels:
+                    self.metric_labels['mAP50_95'].setText(f"{map50_95:.4f}")
                 if '精确率' in self.metric_labels:
                     self.metric_labels['精确率'].setText(f"{precision:.4f}")
                 if '召回率' in self.metric_labels:

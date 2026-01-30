@@ -255,12 +255,14 @@ class MainWindow(QMainWindow):
         self.settings.setValue("windowState", self.saveState())
     
     def on_theme_changed(self, theme_key):
-        """处理主题变化"""
-        # 应用新的样式表
-        self.setStyleSheet(get_full_stylesheet(theme_key))
+        """处理主题变化（固定为深色主题）"""
+        # 始终使用深色主题
+        dark_theme_key = 'dark'
+        # 应用深色主题样式表
+        self.setStyleSheet(get_full_stylesheet(dark_theme_key))
         
-        # 保存主题设置
-        self.settings.setValue("theme", "浅色主题" if theme_key == 'light' else "深色主题")
+        # 保存主题设置为深色主题
+        self.settings.setValue("theme", "深色主题")
     
     def closeEvent(self, event):
         """关闭事件"""

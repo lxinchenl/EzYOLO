@@ -54,6 +54,11 @@ ULTRALYTICS_MODELS = {
         "tasks": ["detect"],
         "prefix": "yolo12",
     },
+    "YOLOv26": {
+        "sizes": ["n", "s", "m", "l", "x"],
+        "tasks": ["detect", "classify", "obb", "pose", "segment"],
+        "prefix": "yolo26",
+    },
 }
 
 

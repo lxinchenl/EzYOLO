@@ -72,13 +72,13 @@ class SettingsPage(QWidget):
         
         layout = QFormLayout(group)
         
-        # 主题选择
+        # 主题选择（只保留深色主题）
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["深色主题", "浅色主题"])
-        current_theme = self.settings.value("theme", "深色主题")
-        index = self.theme_combo.findText(current_theme)
-        if index >= 0:
-            self.theme_combo.setCurrentIndex(index)
+        self.theme_combo.addItem("深色主题")
+        # 固定为深色主题
+        self.theme_combo.setCurrentIndex(0)
+        # 禁用下拉框，防止用户修改
+        self.theme_combo.setEnabled(False)
         layout.addRow("主题:", self.theme_combo)
         
         return group

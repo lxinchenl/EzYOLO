@@ -61,6 +61,11 @@ ULTRALYTICS_MODELS = {
         "tasks": ["detect"],
         "prefix": "yolo12",
     },
+    "YOLOv26": {
+        "sizes": ["n", "s", "m", "l", "x"],
+        "tasks": ["detect", "classify", "obb", "pose", "segment"],
+        "prefix": "yolo26",
+    },
 }
 
 # 任务类型显示名称
@@ -253,7 +258,7 @@ class TrainingThread(QThread):
                                 return value.item()
                             return value
                         metrics['map50'] = to_scalar(results_dict.get('metrics/mAP50(B)', 0))
-                        metrics['map75'] = to_scalar(results_dict.get('metrics/mAP75(B)', 0))
+                        metrics['map50_95'] = to_scalar(results_dict.get('metrics/mAP50-95(B)', 0))
                 
                 metrics['epoch'] = epoch
                 self.metrics_history.append(metrics)
@@ -267,7 +272,7 @@ class TrainingThread(QThread):
                 self.log_message.emit(f"  训练损失 - {loss_str}")
                 
                 if metrics.get('map50'):
-                    self.log_message.emit(f"  验证指标 - mAP50: {metrics['map50']:.4f}, mAP75: {metrics.get('map75', 0):.4f}")
+                    self.log_message.emit(f"  验证指标 - mAP50: {metrics['map50']:.4f}, mAP50-95: {metrics.get('map50_95', 0):.4f}")
             
             def on_fit_epoch_end(trainer):
                 """每个fit epoch结束时调用（包含验证）"""
@@ -292,8 +297,8 @@ class TrainingThread(QThread):
                 device=device,
                 workers=self.config.get('workers', 4),
                 verbose=True,
-                project='runs/train',
-                name=f'exp_{self.project_id}' if self.project_id else 'exp',
+                project='runs',
+                name=f'train/exp_{self.project_id}' if self.project_id else 'train/exp',
                 exist_ok=True,
                 mosaic=self.config.get('mosaic', True),
                 mixup=self.config.get('mixup', 0.0),
@@ -306,12 +311,12 @@ class TrainingThread(QThread):
             
             # 获取训练结果
             final_map50 = results.results_dict.get('metrics/mAP50(B)', 0)
-            final_map75 = results.results_dict.get('metrics/mAP75(B)', 0)
+            final_map50_95 = results.results_dict.get('metrics/mAP50-95(B)', 0)
             
             self.log_message.emit("=" * 60)
             self.log_message.emit(f"✓ 训练完成！")
             self.log_message.emit(f"  - mAP50: {final_map50:.4f}")
-            self.log_message.emit(f"  - mAP75: {final_map75:.4f}")
+            self.log_message.emit(f"  - mAP50-95: {final_map50_95:.4f}")
             self.log_message.emit("=" * 60)
             
             if self._is_running:
@@ -966,7 +971,14 @@ class TrainPage(QWidget):
             'cls': self.loss_ax.plot([], [], 'r-', label='Cls Loss', linewidth=2)[0],
             'dfl': self.loss_ax.plot([], [], 'g-', label='DFL Loss', linewidth=2)[0],
         }
-        self.loss_ax.legend(loc='upper right', facecolor=COLORS['sidebar'], edgecolor=COLORS['border'])
+        # 设置标签颜色为白色
+        self.loss_ax.legend(loc='upper right', facecolor=COLORS['sidebar'], edgecolor=COLORS['border'], labelcolor='white')
+        # 设置坐标轴文字颜色为白色
+        self.loss_ax.xaxis.label.set_color('white')
+        self.loss_ax.yaxis.label.set_color('white')
+        # 设置刻度文字颜色为白色
+        self.loss_ax.tick_params(axis='x', colors='white')
+        self.loss_ax.tick_params(axis='y', colors='white')
         
         return tab
     
@@ -994,9 +1006,16 @@ class TrainPage(QWidget):
         # 初始化空曲线
         self.map_lines = {
             'map50': self.map_ax.plot([], [], 'b-', label='mAP50', linewidth=2)[0],
-            'map75': self.map_ax.plot([], [], 'r-', label='mAP75', linewidth=2)[0],
+            'map50_95': self.map_ax.plot([], [], 'r-', label='mAP50-95', linewidth=2)[0],
         }
-        self.map_ax.legend(loc='lower right', facecolor=COLORS['sidebar'], edgecolor=COLORS['border'])
+        # 设置标签颜色为白色
+        self.map_ax.legend(loc='lower right', facecolor=COLORS['sidebar'], edgecolor=COLORS['border'], labelcolor='white')
+        # 设置坐标轴文字颜色为白色
+        self.map_ax.xaxis.label.set_color('white')
+        self.map_ax.yaxis.label.set_color('white')
+        # 设置刻度文字颜色为白色
+        self.map_ax.tick_params(axis='x', colors='white')
+        self.map_ax.tick_params(axis='y', colors='white')
         
         return tab
     
@@ -1219,12 +1238,12 @@ class TrainPage(QWidget):
         
         # 更新mAP曲线
         map50_values = [h['metrics'].get('map50', 0) for h in self.training_history]
-        map75_values = [h['metrics'].get('map75', 0) for h in self.training_history]
+        map50_95_values = [h['metrics'].get('map50_95', 0) for h in self.training_history]
         
-        if any(map50_values):
-            self.map_lines['map50'].set_data(epochs, map50_values)
-        if any(map75_values):
-            self.map_lines['map75'].set_data(epochs, map75_values)
+        # 更新图表数据
+        self.map_lines['map50'].set_data(epochs, map50_values)
+        if any(map50_95_values):
+            self.map_lines['map50_95'].set_data(epochs, map50_95_values)
         
         self.map_ax.set_xlim(0, max(epochs) + 1)
         self.map_ax.set_ylim(0, 1)
