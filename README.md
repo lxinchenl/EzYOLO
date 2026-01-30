@@ -79,6 +79,7 @@ python main.py
 - **Enter**: 完成当前标注
 
 <img width="518" height="551" alt="image" src="https://github.com/user-attachments/assets/61dd2ecd-fdb7-4a8e-b328-6446ed0a936b" />
+
 #### 自动标注
 1. 进入项目后，切换到"标注"页面
 2. 点击顶部工具栏的"🤖 自动标注"按钮
@@ -183,5 +184,6 @@ python main.py
 - 关闭不需要的应用程序
 - 清理临时文件和缓存
 - 定期清理runs和datasets文件夹
+
 
 
