@@ -739,6 +739,9 @@ class AnnotationCanvas(QFrame):
             # 删除选中的标注
             if self.selected_annotation_id is not None:
                 self.annotation_deleted.emit(self.selected_annotation_id)
+        else:
+            # 将未处理的事件传递给父组件
+            self.parent().keyPressEvent(event)
     
     def check_annotation_selection(self, pos: QPoint):
         """检查是否选中了某个标注"""
@@ -1299,47 +1302,79 @@ Esc - 取消操作
         self.loading_overlay = LoadingOverlay(self, "正在加载项目数据...")
         self.loading_overlay.show_loading()
         
-        # 使用定时器延迟加载，让UI先显示加载动画
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(100, self.load_project_data)
-    
-    def load_project_data(self):
-        """加载项目数据"""
-        if not self.current_project_id:
-            # 隐藏加载动画
-            if hasattr(self, 'loading_overlay'):
-                self.loading_overlay.hide_loading()
-            return
+        # 创建后台线程来加载项目数据
+        from PyQt6.QtCore import QThread, pyqtSignal
         
-        try:
-            # 加载项目信息
-            project = db.get_project(self.current_project_id)
-            if project:
-                # 加载类别
-                import json
+        class ProjectLoadThread(QThread):
+            """项目数据加载线程"""
+            
+            data_loaded = pyqtSignal(dict)
+            finished = pyqtSignal()
+            
+            def __init__(self, project_id):
+                super().__init__()
+                self.project_id = project_id
+            
+            def run(self):
+                """运行线程"""
                 try:
-                    self.classes = json.loads(project.get('classes', '[]'))
-                except:
-                    self.classes = []
-                
-                if not self.classes:
-                    # 添加默认类别
-                    self.classes = [
-                        {'id': 0, 'name': 'person', 'color': '#FF0000'},
-                        {'id': 1, 'name': 'car', 'color': '#00FF00'}
-                    ]
-                
-                self.update_class_list()
-            
-            # 加载图片列表
-            self.load_image_list()
-            
-        finally:
-            # 隐藏加载动画
-            if hasattr(self, 'loading_overlay'):
-                self.loading_overlay.hide_loading()
-                self.loading_overlay.deleteLater()
-                delattr(self, 'loading_overlay')
+                    # 加载项目信息
+                    project = db.get_project(self.project_id)
+                    classes = []
+                    
+                    if project:
+                        # 加载类别
+                        import json
+                        try:
+                            classes = json.loads(project.get('classes', '[]'))
+                        except:
+                            classes = []
+                        
+                        if not classes:
+                            # 添加默认类别
+                            classes = [
+                                {'id': 0, 'name': 'person', 'color': '#FF0000'},
+                                {'id': 1, 'name': 'car', 'color': '#00FF00'}
+                            ]
+                    
+                    # 加载图片列表数据
+                    images = db.get_project_images(self.project_id)
+                    
+                    # 发送加载完成信号
+                    self.data_loaded.emit({'classes': classes, 'images': images})
+                finally:
+                    self.finished.emit()
+        
+        # 创建并启动线程
+        self.load_thread = ProjectLoadThread(project_id)
+        self.load_thread.data_loaded.connect(self.on_project_data_loaded)
+        self.load_thread.finished.connect(self.on_project_load_finished)
+        self.load_thread.start()
+    
+    def on_project_data_loaded(self, data):
+        """项目数据加载完成回调"""
+        # 更新类别
+        self.classes = data.get('classes', [])
+        self.update_class_list()
+        
+        # 保存图片数据
+        self.images = data.get('images', [])
+        
+        # 开始加载图片列表（使用多线程加载缩略图）
+        self.load_image_list()
+    
+    def on_project_load_finished(self):
+        """项目加载完成回调"""
+        # 隐藏加载动画
+        if hasattr(self, 'loading_overlay'):
+            self.loading_overlay.hide_loading()
+            self.loading_overlay.deleteLater()
+            delattr(self, 'loading_overlay')
+        
+        # 清理线程
+        if hasattr(self, 'load_thread'):
+            self.load_thread.wait()
+            delattr(self, 'load_thread')
     
     def load_image_list(self):
         """加载图片列表 - 使用多线程"""
@@ -1540,12 +1575,14 @@ Esc - 取消操作
                 conf_threshold = settings.get('conf_threshold', 0.5)
                 iou_threshold = settings.get('iou_threshold', 0.45)
                 class_mapping = settings.get('class_mapping', {})
+                overwrite_labels = settings.get('overwrite_labels', False)
             else:
                 # 默认模型参数
                 model_path = "yolov8n"
                 conf_threshold = 0.5
                 iou_threshold = 0.45
                 class_mapping = {}
+                overwrite_labels = False
             
             labeler = AutoLabeler(model_path, self.model_manager)
             annotations = labeler.process_image(
@@ -1558,6 +1595,10 @@ Esc - 取消操作
             # 更新当前图像的标注
             if annotations and self.current_image_id:
                 # 保存标注到数据库
+                # 如果需要覆盖原标签，先删除所有原标注
+                if overwrite_labels:
+                    db.delete_image_annotations(self.current_image_id)
+                
                 for annotation in annotations:
                     # 获取类别名称
                     class_id = annotation['class_id']
@@ -1596,6 +1637,10 @@ Esc - 取消操作
                 
                 QMessageBox.information(self, "成功", "自动标注完成！")
             else:
+                # 如果没有检测到目标，但需要覆盖原标签，也删除原标注
+                if overwrite_labels and self.current_image_id:
+                    db.delete_image_annotations(self.current_image_id)
+                    self.load_current_image_annotations()
                 QMessageBox.information(self, "提示", "未检测到目标")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"自动标注失败: {str(e)}")
@@ -1661,11 +1706,18 @@ Esc - 取消操作
             labeler = AutoLabeler(model_path, self.model_manager)
             annotations = labeler.process_image(image_path, conf_threshold, iou_threshold, class_mapping)
             
+            # 获取覆盖标签设置
+            overwrite_labels = False
+            if hasattr(self, 'auto_label_settings'):
+                overwrite_labels = self.auto_label_settings.get('overwrite_labels', False)
+            
             # 更新当前图像的标注
             if annotations and self.current_image_id:
                 # 保存标注到数据库
-                # 首先删除原标注
-                # 然后保存新标注
+                # 如果需要覆盖原标签，先删除所有原标注
+                if overwrite_labels:
+                    db.delete_image_annotations(self.current_image_id)
+                
                 for annotation in annotations:
                     # 获取类别名称
                     class_id = annotation['class_id']
@@ -1703,6 +1755,12 @@ Esc - 取消操作
                 self.load_current_image_annotations()
                 
                 QMessageBox.information(self, "成功", "自动标注完成！")
+            else:
+                # 如果没有检测到目标，但需要覆盖原标签，也删除原标注
+                if overwrite_labels and self.current_image_id:
+                    db.delete_image_annotations(self.current_image_id)
+                    self.load_current_image_annotations()
+                QMessageBox.information(self, "提示", "未检测到目标")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"自动标注失败: {str(e)}")
     
@@ -1822,11 +1880,13 @@ Esc - 取消操作
         # 更新状态栏
         self.update_status_bar()
         
-        # 高亮当前项
+        # 高亮当前项并滚动到该项
         for i in range(self.image_list.count()):
             item = self.image_list.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == image_id:
                 item.setSelected(True)
+                # 滚动到当前项
+                self.image_list.scrollToItem(item)
             else:
                 item.setSelected(False)
     
@@ -1892,8 +1952,14 @@ Esc - 取消操作
         """标注修改事件（拖动或调整大小后）"""
         annotation = next((ann for ann in self.annotations if ann['id'] == annotation_id), None)
         if annotation:
+            # 更新数据库中的标注
+            db.update_annotation(annotation_id, data=data)
+            
             # 更新属性面板
             self.update_attribute_panel(annotation)
+            
+            # 添加到历史记录
+            self.add_history('modify', {'annotation_id': annotation_id, 'old_data': data.copy()})
     
     def on_annotation_deleted(self, annotation_id: int):
         """标注删除事件"""

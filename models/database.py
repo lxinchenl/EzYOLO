@@ -366,6 +366,44 @@ class Database:
             
             return cursor.lastrowid
     
+    def update_annotation(self, annotation_id: int, data: Dict = None, class_id: int = None) -> bool:
+        """
+        更新标注
+        
+        Args:
+            annotation_id: 标注ID
+            data: 标注数据
+            class_id: 类别ID
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            updates = []
+            values = []
+            
+            if data is not None:
+                updates.append("data = ?")
+                values.append(json.dumps(data))
+            
+            if class_id is not None:
+                updates.append("class_id = ?")
+                values.append(class_id)
+            
+            # 总是更新updated_at时间戳
+            updates.append("updated_at = ?")
+            values.append(datetime.now().isoformat())
+            
+            if not updates:
+                return False
+            
+            values.append(annotation_id)
+            
+            cursor.execute(
+                f"UPDATE annotations SET {', '.join(updates)} WHERE id = ?",
+                values
+            )
+            return cursor.rowcount > 0
+    
     def get_image_annotations(self, image_id: int) -> List[Dict]:
         """获取图像的所有标注"""
         with self.get_connection() as conn:
