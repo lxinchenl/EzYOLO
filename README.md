@@ -23,19 +23,22 @@ python main.py
 ## 操作指南
 
 ### 1. 项目创建与管理
+<img width="1132" height="434" alt="image" src="https://github.com/user-attachments/assets/cb6c7f38-2888-4db1-9e75-715025ec5125" />
 
 #### 创建新项目
 1. 启动EzYOLO应用
 2. 在主界面点击"新建项目"按钮
-3. 填写项目名称和描述
+3. 填写项目名称
 4. 选择项目类型（默认为目标检测）
 5. 点击"创建"按钮完成项目创建
+
 
 #### 选择现有项目
 1. 在主界面的项目列表中选择一个项目
 2. 点击"打开项目"按钮进入项目
 
 ### 2. 数据导入
+<img width="1130" height="692" alt="image" src="https://github.com/user-attachments/assets/ea6f4a2f-0019-4a9c-96fd-3713409ac3c4" />
 
 #### 导入图像文件夹
 1. 进入项目后，切换到"导入"页面
@@ -56,7 +59,9 @@ python main.py
 3. 选择包含标注文件的文件夹
 4. 等待导入完成，查看导入结果
 
+
 ### 3. 图像标注
+<img width="1132" height="718" alt="image" src="https://github.com/user-attachments/assets/4ec6e082-076d-4483-a7c7-17bb227504c4" />
 
 #### 基本标注操作
 1. 进入项目后，切换到"标注"页面
@@ -73,6 +78,7 @@ python main.py
 - **空格键**: 快速切换到下一张图片
 - **Enter**: 完成当前标注
 
+<img width="518" height="551" alt="image" src="https://github.com/user-attachments/assets/61dd2ecd-fdb7-4a8e-b328-6446ed0a936b" />
 #### 自动标注
 1. 进入项目后，切换到"标注"页面
 2. 点击顶部工具栏的"🤖 自动标注"按钮
@@ -81,7 +87,9 @@ python main.py
 5. 点击"🔍 单张推理"或"📋 批量推理"开始自动标注
 6. 查看自动标注结果并进行必要的调整
 
+
 ### 4. 模型训练
+<img width="1088" height="707" alt="image" src="https://github.com/user-attachments/assets/3832ae26-c3d0-4650-87eb-bcb5a3a7071c" />
 
 #### 配置训练参数
 1. 进入项目后，切换到"训练"页面
@@ -175,4 +183,5 @@ python main.py
 - 关闭不需要的应用程序
 - 清理临时文件和缓存
 - 定期清理runs和datasets文件夹
+
 
