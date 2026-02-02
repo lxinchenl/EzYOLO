@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 
 # 导入自动标注相关模块
 from gui.pages.auto_label_dialog import AutoLabelDialog
+from gui.pages.batch_process_dialog import BatchProcessDialog
 from core.auto_labeler import BatchLabelingManager
 from core.model_manager import ModelManager
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize, QPoint, QRect
@@ -126,18 +127,16 @@ class AnnotationCanvas(QFrame):
         # 手柄大小
         self.handle_size = 8
         
-        # 类别颜色
-        self.class_colors = {
-            0: QColor(255, 0, 0),      # 红色
-            1: QColor(0, 255, 0),      # 绿色
-            2: QColor(0, 0, 255),      # 蓝色
-            3: QColor(255, 255, 0),    # 黄色
-            4: QColor(255, 0, 255),    # 紫色
-            5: QColor(0, 255, 255),    # 青色
-        }
+        # 类别颜色（动态获取）
+        self.class_colors = {}
         
         # 当前选中的类别ID
         self.current_class_id = 0
+        
+        # 批量处理模式
+        self.batch_process_mode = False
+        self.batch_process_points = []
+        self.batch_process_dialog = None
         
         self.init_ui()
     
@@ -262,6 +261,34 @@ class AnnotationCanvas(QFrame):
         # 绘制鼠标辅助线
         if self.current_image and self.current_point:
             self.draw_guide_lines(painter)
+        
+        # 批量处理模式：绘制已选择的像素点
+        if self.batch_process_mode and self.batch_process_points:
+            self.draw_batch_process_points(painter)
+    
+    def draw_batch_process_points(self, painter: QPainter):
+        """绘制批量处理模式下选择的像素点"""
+        # 设置绘制样式
+        painter.setPen(QPen(QColor(255, 0, 0), 2))
+        painter.setBrush(QBrush(QColor(255, 0, 0)))
+        
+        # 绘制每个像素点
+        for i, (img_x, img_y) in enumerate(self.batch_process_points):
+            # 将图像坐标转换为控件坐标
+            widget_pos = self.image_to_widget(img_x, img_y)
+            
+            # 绘制圆点
+            radius = 6
+            painter.drawEllipse(widget_pos, radius, radius)
+            
+            # 绘制点编号
+            painter.setPen(QColor(255, 255, 255))
+            painter.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+            painter.drawText(widget_pos.x() + radius + 2, widget_pos.y() - radius, str(i + 1))
+            
+            # 恢复绘制样式
+            painter.setPen(QPen(QColor(255, 0, 0), 2))
+            painter.setBrush(QBrush(QColor(255, 0, 0)))
     
     def draw_annotations(self, painter: QPainter):
         """绘制所有标注"""
@@ -271,8 +298,10 @@ class AnnotationCanvas(QFrame):
             data = annotation.get('data', {})
             class_id = annotation.get('class_id', 0)
             
-            # 获取颜色
+            # 获取颜色（优先从class_colors字典，否则使用默认灰色）
             color = self.class_colors.get(class_id, QColor(128, 128, 128))
+            if isinstance(color, str):
+                color = QColor(color)
             
             # 如果是选中的标注，使用高亮颜色
             is_selected = (ann_id == self.selected_annotation_id)
@@ -424,6 +453,26 @@ class AnnotationCanvas(QFrame):
     def mousePressEvent(self, event: QMouseEvent):
         """鼠标按下事件"""
         if self.current_image is None:
+            return
+        
+        # 批量处理模式：点击选择像素点
+        if self.batch_process_mode and event.button() == Qt.MouseButton.LeftButton:
+            # 将鼠标位置转换为图像坐标
+            img_x, img_y = self.widget_to_image(event.pos().x(), event.pos().y())
+            
+            # 检查是否在图像范围内
+            img_width = self.current_image.width()
+            img_height = self.current_image.height()
+            
+            if 0 <= img_x <= img_width and 0 <= img_y <= img_height:
+                # 添加像素点
+                self.batch_process_points.append((int(img_x), int(img_y)))
+                
+                # 更新对话框中的显示
+                if self.batch_process_dialog:
+                    self.batch_process_dialog.add_point(int(img_x), int(img_y))
+                
+                self.update()
             return
         
         if event.button() == Qt.MouseButton.LeftButton:
@@ -618,14 +667,27 @@ class AnnotationCanvas(QFrame):
         ann_type = annotation.get('type', 'bbox')
         data = annotation['data']
         
+        # 获取图像尺寸
+        img_width = self.current_image.width() if self.current_image else 0
+        img_height = self.current_image.height() if self.current_image else 0
+        
         if ann_type == 'bbox':
-            data['x'] = self.drag_start_annotation['x'] + img_delta_x
-            data['y'] = self.drag_start_annotation['y'] + img_delta_y
+            new_x = self.drag_start_annotation['x'] + img_delta_x
+            new_y = self.drag_start_annotation['y'] + img_delta_y
+            width = data.get('width', 0)
+            height = data.get('height', 0)
+            
+            # 限制在图像范围内
+            data['x'] = max(0, min(new_x, img_width - width))
+            data['y'] = max(0, min(new_y, img_height - height))
         elif ann_type == 'polygon':
             start_points = self.drag_start_annotation['points']
             for i, point in enumerate(data['points']):
-                point['x'] = start_points[i]['x'] + img_delta_x
-                point['y'] = start_points[i]['y'] + img_delta_y
+                new_x = start_points[i]['x'] + img_delta_x
+                new_y = start_points[i]['y'] + img_delta_y
+                # 限制在图像范围内
+                point['x'] = max(0, min(new_x, img_width))
+                point['y'] = max(0, min(new_y, img_height))
     
     def resize_annotation(self, pos: QPoint):
         """调整标注大小"""
@@ -642,38 +704,52 @@ class AnnotationCanvas(QFrame):
         # 将鼠标位置转换为图像坐标
         img_x, img_y = self.widget_to_image(pos.x(), pos.y())
         
+        # 限制鼠标位置在图像范围内
+        if self.current_image:
+            img_width = self.current_image.width()
+            img_height = self.current_image.height()
+            img_x = max(0, min(img_x, img_width))
+            img_y = max(0, min(img_y, img_height))
+        
         if self.resize_handle == 'top_left':
             new_x = min(img_x, start['x'] + start['width'])
             new_y = min(img_y, start['y'] + start['height'])
-            data['x'] = new_x
-            data['y'] = new_y
-            data['width'] = start['x'] + start['width'] - new_x
-            data['height'] = start['y'] + start['height'] - new_y
+            data['x'] = max(0, new_x)
+            data['y'] = max(0, new_y)
+            data['width'] = start['x'] + start['width'] - data['x']
+            data['height'] = start['y'] + start['height'] - data['y']
         elif self.resize_handle == 'top_right':
             new_y = min(img_y, start['y'] + start['height'])
             data['x'] = start['x']
-            data['y'] = new_y
-            data['width'] = img_x - start['x']
-            data['height'] = start['y'] + start['height'] - new_y
+            data['y'] = max(0, new_y)
+            data['width'] = min(img_x, img_width) - start['x'] if self.current_image else img_x - start['x']
+            data['height'] = start['y'] + start['height'] - data['y']
         elif self.resize_handle == 'bottom_left':
             new_x = min(img_x, start['x'] + start['width'])
-            data['x'] = new_x
+            data['x'] = max(0, new_x)
             data['y'] = start['y']
-            data['width'] = start['x'] + start['width'] - new_x
-            data['height'] = img_y - start['y']
+            data['width'] = start['x'] + start['width'] - data['x']
+            data['height'] = min(img_y, img_height) - start['y'] if self.current_image else img_y - start['y']
         elif self.resize_handle == 'bottom_right':
             data['x'] = start['x']
             data['y'] = start['y']
-            data['width'] = img_x - start['x']
-            data['height'] = img_y - start['y']
+            data['width'] = min(img_x, img_width) - start['x'] if self.current_image else img_x - start['x']
+            data['height'] = min(img_y, img_height) - start['y'] if self.current_image else img_y - start['y']
         
-        # 确保宽度和高度为正
+        # 确保宽度和高度为正且不超过图像范围
         if data['width'] < 0:
             data['x'] += data['width']
             data['width'] = abs(data['width'])
         if data['height'] < 0:
             data['y'] += data['height']
             data['height'] = abs(data['height'])
+        
+        # 最终限制在图像范围内
+        if self.current_image:
+            data['x'] = max(0, min(data['x'], img_width))
+            data['y'] = max(0, min(data['y'], img_height))
+            data['width'] = min(data['width'], img_width - data['x'])
+            data['height'] = min(data['height'], img_height - data['y'])
     
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """鼠标双击事件 - 完成多边形绘制"""
@@ -822,6 +898,19 @@ class AnnotationCanvas(QFrame):
         width = abs(x2 - x1)
         height = abs(y2 - y1)
         
+        # 限制坐标在图像范围内
+        if self.current_image:
+            img_width = self.current_image.width()
+            img_height = self.current_image.height()
+            
+            # 限制x和y在图像范围内
+            x = max(0, min(x, img_width))
+            y = max(0, min(y, img_height))
+            
+            # 限制width和height不超出图像范围
+            width = min(width, img_width - x)
+            height = min(height, img_height - y)
+        
         # 过滤太小的标注
         if width < 5 or height < 5:
             return
@@ -850,6 +939,14 @@ class AnnotationCanvas(QFrame):
         points = []
         for point in self.polygon_points:
             x, y = self.widget_to_image(point.x(), point.y())
+            
+            # 限制坐标在图像范围内
+            if self.current_image:
+                img_width = self.current_image.width()
+                img_height = self.current_image.height()
+                x = max(0, min(x, img_width))
+                y = max(0, min(y, img_height))
+            
             points.append({'x': x, 'y': y})
         
         annotation = {
@@ -1085,6 +1182,25 @@ class AnnotatePage(QWidget):
             f"}}"
         )
         toolbar.addWidget(self.btn_auto_label)
+        
+        # 批量处理按钮
+        toolbar.addSeparator()
+        self.btn_batch_process = QPushButton("📋 批量处理")
+        self.btn_batch_process.clicked.connect(self.show_batch_process_dialog)
+        self.btn_batch_process.setStyleSheet(
+            f"QPushButton {{"  
+            f"    background-color: {COLORS['secondary']};" 
+            f"    color: white;" 
+            f"    border: none;" 
+            f"    border-radius: 4px;" 
+            f"    padding: 6px 12px;" 
+            f"    font-weight: bold;" 
+            f"}}" 
+            f"QPushButton:hover {{" 
+            f"    background-color: {COLORS['secondary']};" 
+            f"}}"
+        )
+        toolbar.addWidget(self.btn_batch_process)
         
         return toolbar
     
@@ -1446,6 +1562,12 @@ Esc - 取消操作
         self.class_list.clear()
         self.attr_class.clear()
         
+        # 更新canvas的类别颜色
+        class_colors = {}
+        for cls in self.classes:
+            class_colors[cls['id']] = cls.get('color', '#808080')
+        self.canvas.class_colors = class_colors
+        
         for cls in self.classes:
             # 创建带颜色的列表项
             item = QListWidgetItem(f"■ {cls['name']}")
@@ -1554,6 +1676,155 @@ Esc - 取消操作
                     # 更新界面
                     self.update_class_list()
                     QMessageBox.information(self, "成功", "类别列表已更新")
+    
+    def show_batch_process_dialog(self):
+        """显示批量处理标注对话框"""
+        if not self.current_project_id:
+            QMessageBox.warning(self, "提示", "请先选择一个项目")
+            return
+        
+        if not self.images:
+            QMessageBox.warning(self, "提示", "项目中没有图片")
+            return
+        
+        # 创建对话框
+        dialog = BatchProcessDialog(self, self.classes, len(self.images))
+        dialog.process_requested.connect(self.on_batch_process_requested)
+        
+        # 进入像素点选择模式
+        self.batch_process_dialog = dialog
+        self.canvas.batch_process_mode = True
+        self.canvas.batch_process_points = []
+        self.canvas.batch_process_dialog = dialog
+        
+        # 显示对话框（非模态，允许在图片上点击）
+        dialog.show()
+    
+    def on_batch_process_requested(self, config):
+        """处理批量处理请求"""
+        # 退出像素点选择模式
+        self.canvas.batch_process_mode = False
+        self.canvas.batch_process_points = []
+        self.canvas.batch_process_dialog = None
+        
+        # 执行批量处理
+        self.execute_batch_process(config)
+    
+    def execute_batch_process(self, config):
+        """执行批量处理"""
+        points = config['points']
+        start_idx = config['start_idx']
+        end_idx = config['end_idx']
+        operation = config['operation']
+        
+        # 获取处理范围内的图片
+        images_to_process = self.images[start_idx:end_idx+1]
+        
+        if not images_to_process:
+            QMessageBox.warning(self, "提示", "没有需要处理的图片")
+            return
+        
+        # 显示进度对话框
+        from PyQt6.QtWidgets import QProgressDialog
+        progress = QProgressDialog("正在批量处理标注...", "取消", 0, len(images_to_process), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        
+        processed_count = 0
+        modified_count = 0
+        
+        try:
+            for i, image_data in enumerate(images_to_process):
+                if progress.wasCanceled():
+                    break
+                
+                progress.setValue(i)
+                progress.setLabelText(f"正在处理第 {i+1}/{len(images_to_process)} 张图片...")
+                
+                image_id = image_data['id']
+                annotations = db.get_image_annotations(image_id)
+                
+                if not annotations:
+                    continue
+                
+                # 检查每个标注是否覆盖选择的像素点
+                for annotation in annotations:
+                    annotation_data = annotation.get('data', {})
+                    annotation_type = annotation.get('type', 'bbox')
+                    
+                    # 检查标注是否覆盖任何选择的像素点
+                    covers_point = False
+                    for point in points:
+                        px, py = point
+                        if self.is_point_in_annotation_data(px, py, annotation_data, annotation_type):
+                            covers_point = True
+                            break
+                    
+                    if covers_point:
+                        if operation == 'delete':
+                            # 批量删除：检查类别是否在目标类别列表中
+                            target_classes = config.get('target_classes', [])
+                            if annotation.get('class_id') in target_classes:
+                                db.delete_annotation(annotation['id'])
+                                modified_count += 1
+                        else:
+                            # 批量修改：检查类别是否在源类别列表中
+                            source_classes = config.get('source_classes', [])
+                            target_class = config.get('target_class')
+                            if annotation.get('class_id') in source_classes:
+                                db.update_annotation(annotation['id'], class_id=target_class)
+                                modified_count += 1
+                
+                processed_count += 1
+            
+            progress.setValue(len(images_to_process))
+            
+            # 显示结果
+            QMessageBox.information(
+                self, 
+                "批量处理完成", 
+                f"处理完成！\n处理了 {processed_count} 张图片\n修改了 {modified_count} 个标注"
+            )
+            
+            # 刷新当前图片的标注显示
+            if self.current_image_id:
+                self.load_annotations()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"批量处理出错: {str(e)}")
+    
+    def is_point_in_annotation_data(self, px: int, py: int, data: dict, ann_type: str) -> bool:
+        """检查点是否在标注数据内"""
+        if ann_type == 'bbox':
+            x = data.get('x', 0)
+            y = data.get('y', 0)
+            width = data.get('width', 0)
+            height = data.get('height', 0)
+            return x <= px <= x + width and y <= py <= y + height
+        elif ann_type == 'polygon':
+            points = data.get('points', [])
+            if len(points) < 3:
+                return False
+            # 使用射线法判断点是否在多边形内
+            return self.point_in_polygon(px, py, points)
+        return False
+    
+    def point_in_polygon(self, x: int, y: int, polygon: list) -> bool:
+        """射线法判断点是否在多边形内"""
+        n = len(polygon)
+        inside = False
+        p1x, p1y = polygon[0]['x'], polygon[0]['y']
+        for i in range(1, n + 1):
+            p2x, p2y = polygon[i % n]['x'], polygon[i % n]['y']
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        return inside
     
     def run_single_inference(self):
         """运行单张图像推理"""
@@ -2306,29 +2577,41 @@ Esc - 取消操作
         rect_tool_key = settings.value("rect_tool_shortcut", "W").upper()
         poly_tool_key = settings.value("poly_tool_shortcut", "P").upper()
         move_tool_key = settings.value("move_tool_shortcut", "V").upper()
+        prev_image_key = settings.value("prev_image_shortcut", "A").upper()
+        next_image_key = settings.value("next_image_shortcut", "D").upper()
         
         # 处理工具快捷键
-        if event.text().upper() == rect_tool_key:
+        key_text = event.text().upper()
+        if key_text == rect_tool_key:
             self.btn_rectangle.setChecked(True)
             self.set_tool('rectangle')
             return
-        elif event.text().upper() == poly_tool_key:
+        elif key_text == poly_tool_key:
             self.btn_polygon.setChecked(True)
             self.set_tool('polygon')
             return
-        elif event.text().upper() == move_tool_key:
+        elif key_text == move_tool_key:
             self.btn_move.setChecked(True)
             self.set_tool('move')
             return
-        elif event.key() == Qt.Key.Key_D:
-            self.delete_selected_annotation()
-        elif event.key() == Qt.Key.Key_Left:
+        elif key_text == prev_image_key:
             self.prev_image()
-        elif event.key() == Qt.Key.Key_Right:
+            return
+        elif key_text == next_image_key:
             self.next_image()
+            return
+        elif event.key() == Qt.Key.Key_Delete:
+            self.delete_selected_annotation()
         elif event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_Z:
             self.undo()
         else:
+            # 处理数字键1-9切换标签
+            if key_text in ['1', '2', '3', '4', '5', '6', '7', '8', '9']:
+                class_index = int(key_text) - 1
+                if class_index < self.class_list.count():
+                    self.class_list.setCurrentRow(class_index)
+                    self.on_class_selected()
+                    return
             super().keyPressEvent(event)
     
     def export_annotations(self):

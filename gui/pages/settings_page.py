@@ -179,6 +179,30 @@ class SettingsPage(QWidget):
         
         layout.addRow("移动工具:", move_layout)
         
+        # 上一张图片快捷键
+        prev_layout = QHBoxLayout()
+        self.prev_image_shortcut = QLabel(self.settings.value("prev_image_shortcut", "A"))
+        self.prev_image_shortcut.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
+        prev_layout.addWidget(self.prev_image_shortcut)
+        
+        btn_set_prev = QPushButton("设置")
+        btn_set_prev.clicked.connect(lambda: self.set_shortcut("prev_image_shortcut", self.prev_image_shortcut))
+        prev_layout.addWidget(btn_set_prev)
+        
+        layout.addRow("上一张图片:", prev_layout)
+        
+        # 下一张图片快捷键
+        next_layout = QHBoxLayout()
+        self.next_image_shortcut = QLabel(self.settings.value("next_image_shortcut", "D"))
+        self.next_image_shortcut.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
+        next_layout.addWidget(self.next_image_shortcut)
+        
+        btn_set_next = QPushButton("设置")
+        btn_set_next.clicked.connect(lambda: self.set_shortcut("next_image_shortcut", self.next_image_shortcut))
+        next_layout.addWidget(btn_set_next)
+        
+        layout.addRow("下一张图片:", next_layout)
+        
         return group
     
     def set_shortcut(self, setting_key: str, label: QLabel):
@@ -246,12 +270,18 @@ class SettingsPage(QWidget):
             self.poly_tool_shortcut.setText("P")
         if hasattr(self, 'move_tool_shortcut'):
             self.move_tool_shortcut.setText("V")
+        if hasattr(self, 'prev_image_shortcut'):
+            self.prev_image_shortcut.setText("A")
+        if hasattr(self, 'next_image_shortcut'):
+            self.next_image_shortcut.setText("D")
         
         # 保存默认快捷键设置
         self.settings.setValue("reset_view_shortcut", "R")
         self.settings.setValue("rect_tool_shortcut", "W")
         self.settings.setValue("poly_tool_shortcut", "P")
         self.settings.setValue("move_tool_shortcut", "V")
+        self.settings.setValue("prev_image_shortcut", "A")
+        self.settings.setValue("next_image_shortcut", "D")
         
         # 发送主题变化信号（默认是深色主题）
         self.theme_changed.emit('dark')

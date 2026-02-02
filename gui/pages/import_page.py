@@ -160,6 +160,14 @@ class ImportPage(QWidget):
         new_project_btn.clicked.connect(self.create_new_project)
         title_layout.addWidget(new_project_btn)
         
+        # 删除项目按钮
+        delete_project_btn = QPushButton("🗑 删除项目")
+        delete_project_btn.setObjectName("secondary")
+        delete_project_btn.clicked.connect(self.delete_current_project)
+        title_layout.addWidget(delete_project_btn)
+        
+        title_layout.addStretch()
+        
         main_layout.addLayout(title_layout)
         
         # 说明文字
@@ -364,6 +372,51 @@ class ImportPage(QWidget):
             index = self.project_combo.findData(project_id)
             if index >= 0:
                 self.project_combo.setCurrentIndex(index)
+    
+    def delete_current_project(self):
+        """删除当前选中的项目"""
+        project_id = self.project_combo.currentData()
+        
+        if not project_id:
+            QMessageBox.warning(self, "提示", "请先选择一个项目")
+            return
+        
+        # 获取项目名称
+        project_name = self.project_combo.currentText()
+        
+        # 确认删除
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定要删除项目 \"{project_name}\" 吗？\n\n这将删除该项目中的所有图片和标注数据，此操作不可恢复！",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                # 删除项目（数据库会自动级联删除相关图片和标注）
+                db.delete_project(project_id)
+                
+                # 清空当前项目ID
+                self.current_project_id = None
+                
+                # 清空图片列表
+                self.image_list.clear()
+                self.images = []
+                self.thumbnail_widgets.clear()
+                self.thumbnail_cache.clear()
+                
+                # 更新状态栏
+                self.update_status_bar()
+                
+                # 重新加载项目列表
+                self.load_projects()
+                
+                QMessageBox.information(self, "成功", f"项目 \"{project_name}\" 已删除")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"删除项目失败: {str(e)}")
     
     def load_project_images(self):
         """加载项目图像 - 使用多线程"""

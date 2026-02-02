@@ -14,6 +14,7 @@ DARK_COLORS = {
     
     # 强调色
     'primary': '#007ACC',
+    'secondary': '#6B8E23',
     'success': '#4EC9B0',
     'warning': '#DCDCAA',
     'error': '#F44747',
@@ -38,6 +39,7 @@ LIGHT_COLORS = {
     
     # 强调色
     'primary': '#0078D7',
+    'secondary': '#6B8E23',
     'success': '#107C10',
     'warning': '#FFB900',
     'error': '#D13438',
