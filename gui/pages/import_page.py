@@ -386,7 +386,7 @@ class ImportPage(QWidget):
         
         dialog = QDialog(self)
         dialog.setWindowTitle("选择任务类型")
-        dialog.setFixedSize(300, 200)
+        dialog.setFixedSize(300, 250)
         dialog.setStyleSheet("""
             QDialog {
                 background-color: """ + COLORS['background'] + """;
@@ -433,10 +433,20 @@ class ImportPage(QWidget):
             segment_radio.setChecked(True)
         layout.addWidget(segment_radio)
         
-        point_radio = QRadioButton("point (关键点检测)")
-        if current_task_type == "point":
-            point_radio.setChecked(True)
-        layout.addWidget(point_radio)
+        pose_radio = QRadioButton("pose (关键点检测)")
+        if current_task_type == "pose" or current_task_type == "point":
+            pose_radio.setChecked(True)
+        layout.addWidget(pose_radio)
+        
+        classify_radio = QRadioButton("classify (图像分类)")
+        if current_task_type == "classify":
+            classify_radio.setChecked(True)
+        layout.addWidget(classify_radio)
+        
+        obb_radio = QRadioButton("obb (旋转目标检测)")
+        if current_task_type == "obb":
+            obb_radio.setChecked(True)
+        layout.addWidget(obb_radio)
         
         btn_layout = QHBoxLayout()
         ok_btn = QPushButton("确定")
@@ -458,7 +468,7 @@ class ImportPage(QWidget):
             task_type = "segment"
         elif pose_radio.isChecked():
             task_type = "pose"
-        elif cls_radio.isChecked():
+        elif classify_radio.isChecked():
             task_type = "classify"
         elif obb_radio.isChecked():
             task_type = "obb"
@@ -481,7 +491,7 @@ class ImportPage(QWidget):
         # 创建任务标签选择对话框
         dialog = QDialog(self)
         dialog.setWindowTitle("选择任务类型")
-        dialog.setFixedSize(300, 200)
+        dialog.setFixedSize(300, 300)
         dialog.setStyleSheet("""
             QDialog {
                 background-color: """ + COLORS['background'] + """;
@@ -522,8 +532,8 @@ class ImportPage(QWidget):
         pose_radio = QRadioButton("pose (关键点检测)")
         layout.addWidget(pose_radio)
         
-        cls_radio = QRadioButton("cls (分类)")
-        layout.addWidget(cls_radio)
+        classify_radio = QRadioButton("classify (图像分类)")
+        layout.addWidget(classify_radio)
         
         obb_radio = QRadioButton("obb (旋转目标检测)")
         layout.addWidget(obb_radio)
@@ -546,8 +556,14 @@ class ImportPage(QWidget):
             task_type = "detect"
         elif segment_radio.isChecked():
             task_type = "segment"
+        elif pose_radio.isChecked():
+            task_type = "pose"
+        elif classify_radio.isChecked():
+            task_type = "classify"
+        elif obb_radio.isChecked():
+            task_type = "obb"
         else:
-            task_type = "point"
+            task_type = "detect"
         
         # 创建项目
         project_id = db.create_project(
