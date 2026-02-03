@@ -15,6 +15,9 @@
 
 # 安装依赖
 pip install -r requirements.txt
+注意：
+1、如果想用gpu，请自行安装cuda版的pytorch，链接https://pytorch.org/get-started/locally/，选择适配自己设备的版本
+2、如果想使用yolov26，请务必把 Ultralytics 库升级到最新版本，pip install --upgrade Ultralytics
 
 # 运行程序
 python main.py
@@ -184,6 +187,7 @@ python main.py
 - 关闭不需要的应用程序
 - 清理临时文件和缓存
 - 定期清理runs和datasets文件夹
+
 
 
 
