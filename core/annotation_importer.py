@@ -32,13 +32,14 @@ class AnnotationImporter:
         self.classes = json.loads(self.project['classes']) if self.project['classes'] else []
         self.class_map = {cls['name']: cls['id'] for cls in self.classes}
     
-    def import_yolo_annotations(self, labels_dir: str, images_dir: str = None) -> Tuple[int, int]:
+    def import_yolo_annotations(self, labels_dir: str, images_dir: str = None, overwrite: bool = False) -> Tuple[int, int]:
         """
         导入YOLO格式的标注
         
         Args:
             labels_dir: YOLO标签文件夹路径
             images_dir: 对应的图像文件夹路径（可选）
+            overwrite: 是否覆盖已有的标注
             
         Returns:
             (成功导入数量, 跳过数量)
@@ -80,17 +81,39 @@ class AnnotationImporter:
                         skipped += 1
                         continue
                 
+                # 检查是否已经有标注
+                existing_annotations = db.get_image_annotations(image_record['id'])
+                if existing_annotations and not overwrite:
+                    # 如果已经有标注且不覆盖，跳过
+                    skipped += 1
+                    continue
+                
+                # 如果需要覆盖，先删除所有原标注
+                if existing_annotations and overwrite:
+                    db.delete_image_annotations(image_record['id'])
+                
                 # 读取YOLO标注
                 annotations = self._parse_yolo_file(txt_file, image_info)
                 
                 # 导入标注
                 for ann in annotations:
+                    # 根据任务类型设置标注类型
+                    project_task = self.project.get('type', 'detect')
+                    if project_task == 'segment' and 'points' in ann['data']:
+                        annotation_type = 'polygon'
+                    elif project_task == 'pose' and 'keypoints' in ann['data']:
+                        annotation_type = 'keypoint'
+                    elif project_task == 'obb' and 'angle' in ann['data']:
+                        annotation_type = 'obb'
+                    else:
+                        annotation_type = 'bbox'
+                    
                     db.add_annotation(
                         image_id=image_record['id'],
                         project_id=self.project_id,
                         class_id=ann['class_id'],
                         class_name=ann['class_name'],
-                        annotation_type='bbox',
+                        annotation_type=annotation_type,
                         data=ann['data']
                     )
                 
@@ -102,12 +125,13 @@ class AnnotationImporter:
         
         return imported, skipped
     
-    def import_coco_annotations(self, coco_file: str) -> Tuple[int, int]:
+    def import_coco_annotations(self, coco_file: str, overwrite: bool = False) -> Tuple[int, int]:
         """
         导入COCO格式的标注
         
         Args:
             coco_file: COCO JSON文件路径
+            overwrite: 是否覆盖已有的标注
             
         Returns:
             (成功导入数量, 跳过数量)
@@ -148,6 +172,17 @@ class AnnotationImporter:
                     if not image_record:
                         skipped += 1
                         continue
+                
+                # 检查是否已经有标注
+                existing_annotations = db.get_image_annotations(image_record['id'])
+                if existing_annotations and not overwrite:
+                    # 如果已经有标注且不覆盖，跳过
+                    skipped += 1
+                    continue
+                
+                # 如果需要覆盖，先删除所有原标注
+                if existing_annotations and overwrite:
+                    db.delete_image_annotations(image_record['id'])
                 
                 # 获取类别信息
                 category_id = ann.get('category_id')
@@ -203,12 +238,13 @@ class AnnotationImporter:
         
         return imported, skipped
     
-    def import_voc_annotations(self, voc_dir: str) -> Tuple[int, int]:
+    def import_voc_annotations(self, voc_dir: str, overwrite: bool = False) -> Tuple[int, int]:
         """
         导入Pascal VOC格式的标注
         
         Args:
             voc_dir: VOC标注文件夹路径
+            overwrite: 是否覆盖已有的标注
             
         Returns:
             (成功导入数量, 跳过数量)
@@ -245,6 +281,17 @@ class AnnotationImporter:
                     if not image_record:
                         skipped += 1
                         continue
+                
+                # 检查是否已经有标注
+                existing_annotations = db.get_image_annotations(image_record['id'])
+                if existing_annotations and not overwrite:
+                    # 如果已经有标注且不覆盖，跳过
+                    skipped += 1
+                    continue
+                
+                # 如果需要覆盖，先删除所有原标注
+                if existing_annotations and overwrite:
+                    db.delete_image_annotations(image_record['id'])
                 
                 # 获取图像尺寸
                 size_elem = root.find('size')
@@ -324,38 +371,108 @@ class AnnotationImporter:
                     continue
                 
                 parts = line.split()
-                if len(parts) < 5:
+                if len(parts) < 1:
                     continue
                 
-                # 解析YOLO格式: class_id x_center y_center width height
+                # 解析类别ID
                 class_id = int(parts[0])
-                x_center = float(parts[1])
-                y_center = float(parts[2])
-                width = float(parts[3])
-                height = float(parts[4])
+                class_name = self._get_class_name_by_id(class_id)
                 
                 # 转换为像素坐标
                 img_width = image_info['width']
                 img_height = image_info['height']
                 
-                x = (x_center - width / 2) * img_width
-                y = (y_center - height / 2) * img_height
-                w = width * img_width
-                h = height * img_height
+                project_task = self.project.get('type', 'detect')
                 
-                # 获取类别名称
-                class_name = self._get_class_name_by_id(class_id)
-                
-                annotations.append({
-                    'class_id': class_id,
-                    'class_name': class_name,
-                    'data': {
-                        'x': x,
-                        'y': y,
-                        'width': w,
-                        'height': h
-                    }
-                })
+                if project_task == 'classify':
+                    # 分类任务：只需要类别ID
+                    annotations.append({
+                        'class_id': class_id,
+                        'class_name': class_name,
+                        'data': {
+                            'class_id': class_id
+                        }
+                    })
+                elif len(parts) >= 5:
+                    # 解析基本的边界框信息
+                    x_center = float(parts[1])
+                    y_center = float(parts[2])
+                    width = float(parts[3])
+                    height = float(parts[4])
+                    
+                    if project_task == 'segment' and len(parts) > 5:
+                        # 分割任务：处理多边形点
+                        points = []
+                        for i in range(5, len(parts), 2):
+                            if i + 1 < len(parts):
+                                px = float(parts[i]) * img_width
+                                py = float(parts[i + 1]) * img_height
+                                points.append({'x': px, 'y': py})
+                        
+                        annotations.append({
+                            'class_id': class_id,
+                            'class_name': class_name,
+                            'data': {
+                                'points': points
+                            }
+                        })
+                    elif project_task == 'pose' and len(parts) > 5:
+                        # 姿态估计任务：处理关键点
+                        keypoints = []
+                        for i in range(5, len(parts), 3):
+                            if i + 2 < len(parts):
+                                kp_x = float(parts[i]) * img_width
+                                kp_y = float(parts[i + 1]) * img_height
+                                kp_v = float(parts[i + 2])
+                                keypoints.append({
+                                    'x': kp_x,
+                                    'y': kp_y,
+                                    'v': kp_v
+                                })
+                        
+                        annotations.append({
+                            'class_id': class_id,
+                            'class_name': class_name,
+                            'data': {
+                                'x': (x_center - width / 2) * img_width,
+                                'y': (y_center - height / 2) * img_height,
+                                'width': width * img_width,
+                                'height': height * img_height,
+                                'keypoints': keypoints
+                            }
+                        })
+                    elif project_task == 'obb' and len(parts) > 5:
+                        # 旋转目标检测任务：处理角度
+                        angle = float(parts[5]) if len(parts) > 5 else 0.0
+                        
+                        annotations.append({
+                            'class_id': class_id,
+                            'class_name': class_name,
+                            'data': {
+                                'x': (x_center - width / 2) * img_width,
+                                'y': (y_center - height / 2) * img_height,
+                                'width': width * img_width,
+                                'height': height * img_height,
+                                'angle': angle
+                            }
+                        })
+                    else:
+                        # 检测任务：处理边界框
+                        x = (x_center - width / 2) * img_width
+                        y = (y_center - height / 2) * img_height
+                        w = width * img_width
+                        h = height * img_height
+                        
+                        annotations.append({
+                            'class_id': class_id,
+                            'class_name': class_name,
+                            'data': {
+                                'x': x,
+                                'y': y,
+                                'width': w,
+                                'height': h
+                            }
+                        })
             
         except Exception as e:
             print(f"解析YOLO文件失败 {txt_file}: {e}")

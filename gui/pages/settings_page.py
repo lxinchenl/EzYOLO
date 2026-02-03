@@ -203,6 +203,18 @@ class SettingsPage(QWidget):
         
         layout.addRow("下一张图片:", next_layout)
         
+        # 删除标注快捷键
+        delete_layout = QHBoxLayout()
+        self.delete_shortcut = QLabel(self.settings.value("delete_shortcut", "DELETE"))
+        self.delete_shortcut.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
+        delete_layout.addWidget(self.delete_shortcut)
+        
+        btn_set_delete = QPushButton("设置")
+        btn_set_delete.clicked.connect(lambda: self.set_shortcut("delete_shortcut", self.delete_shortcut))
+        delete_layout.addWidget(btn_set_delete)
+        
+        layout.addRow("删除标注:", delete_layout)
+        
         return group
     
     def set_shortcut(self, setting_key: str, label: QLabel):
@@ -274,6 +286,8 @@ class SettingsPage(QWidget):
             self.prev_image_shortcut.setText("A")
         if hasattr(self, 'next_image_shortcut'):
             self.next_image_shortcut.setText("D")
+        if hasattr(self, 'delete_shortcut'):
+            self.delete_shortcut.setText("DELETE")
         
         # 保存默认快捷键设置
         self.settings.setValue("reset_view_shortcut", "R")
@@ -282,6 +296,7 @@ class SettingsPage(QWidget):
         self.settings.setValue("move_tool_shortcut", "V")
         self.settings.setValue("prev_image_shortcut", "A")
         self.settings.setValue("next_image_shortcut", "D")
+        self.settings.setValue("delete_shortcut", "DELETE")
         
         # 发送主题变化信号（默认是深色主题）
         self.theme_changed.emit('dark')

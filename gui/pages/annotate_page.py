@@ -1041,6 +1041,18 @@ class AnnotatePage(QWidget):
         title.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px; font-weight: bold;")
         layout.addWidget(title)
         
+        # 任务类型选择器
+        task_layout = QHBoxLayout()
+        task_label = QLabel("任务类型:")
+        task_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        task_layout.addWidget(task_label)
+        
+        self.task_combo = QComboBox()
+        self.task_combo.addItems(["detect", "segment", "pose", "classify", "obb"])
+        self.task_combo.currentTextChanged.connect(self.on_task_changed)
+        task_layout.addWidget(self.task_combo)
+        layout.addLayout(task_layout)
+        
         # 筛选
         self.image_filter = QComboBox()
         self.image_filter.addItems(["全部", "未标注", "已标注"])
@@ -1475,6 +1487,16 @@ Esc - 取消操作
         
         # 保存图片数据
         self.images = data.get('images', [])
+        
+        # 设置任务类型选择器
+        if self.current_project_id:
+            project = db.get_project(self.current_project_id)
+            if project and project.get('type'):
+                task_type = project['type']
+                if task_type in ['detect', 'segment', 'pose', 'classify', 'obb']:
+                    index = self.task_combo.findText(task_type)
+                    if index >= 0:
+                        self.task_combo.setCurrentIndex(index)
         
         # 开始加载图片列表（使用多线程加载缩略图）
         self.load_image_list()
@@ -2130,6 +2152,15 @@ Esc - 取消操作
         image_id = item.data(Qt.ItemDataRole.UserRole)
         self.load_image(image_id)
     
+    def on_task_changed(self, task_type):
+        """任务类型切换事件"""
+        if self.current_project_id:
+            # 更新项目的任务类型
+            db.update_project(self.current_project_id, type=task_type)
+            # 重新加载当前图片的标注
+            if self.current_image_id:
+                self.load_annotations()
+    
     def load_image(self, image_id: int):
         """加载图片"""
         self.current_image_id = image_id
@@ -2579,6 +2610,7 @@ Esc - 取消操作
         move_tool_key = settings.value("move_tool_shortcut", "V").upper()
         prev_image_key = settings.value("prev_image_shortcut", "A").upper()
         next_image_key = settings.value("next_image_shortcut", "D").upper()
+        delete_key = settings.value("delete_shortcut", "DELETE").upper()
         
         # 处理工具快捷键
         key_text = event.text().upper()
@@ -2600,7 +2632,7 @@ Esc - 取消操作
         elif key_text == next_image_key:
             self.next_image()
             return
-        elif event.key() == Qt.Key.Key_Delete:
+        elif key_text == delete_key:
             self.delete_selected_annotation()
         elif event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_Z:
             self.undo()

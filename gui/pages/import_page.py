@@ -154,6 +154,13 @@ class ImportPage(QWidget):
         self.project_combo.currentIndexChanged.connect(self.on_project_changed)
         title_layout.addWidget(self.project_combo)
         
+        # 任务类别显示和设置
+        self.task_type_label = QLabel("任务类别: 未设置")
+        self.task_type_label.setStyleSheet(f"color: {COLORS['text_secondary']}; padding: 0 10px;")
+        self.task_type_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.task_type_label.mousePressEvent = self.on_task_type_clicked
+        title_layout.addWidget(self.task_type_label)
+        
         # 新建项目按钮
         new_project_btn = QPushButton("+ 新建项目")
         new_project_btn.setObjectName("secondary")
@@ -350,28 +357,209 @@ class ImportPage(QWidget):
         if project_id:
             self.current_project_id = project_id
             self.load_project_images()
+            # 更新任务类别显示
+            self.update_task_type_display()
         else:
             self.current_project_id = None
             self.image_list.clear()
             self.images = []
             self.update_status_bar()
+            # 重置任务类别显示
+            self.task_type_label.setText("任务类别: 未设置")
+    
+    def update_task_type_display(self):
+        """更新任务类别显示"""
+        if self.current_project_id:
+            project = db.get_project(self.current_project_id)
+            if project:
+                task_type = project.get('type', '未设置')
+                self.task_type_label.setText(f"任务类别: {task_type}")
+    
+    def on_task_type_clicked(self, event):
+        """任务类别点击事件"""
+        if not self.current_project_id:
+            QMessageBox.warning(self, "提示", "请先选择一个项目")
+            return
+        
+        # 显示任务类别选择对话框
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QRadioButton, QPushButton, QLabel
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择任务类型")
+        dialog.setFixedSize(300, 200)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: """ + COLORS['background'] + """;
+            }
+            QLabel {
+                color: """ + COLORS['text_primary'] + """;
+                font-size: 14px;
+            }
+            QRadioButton {
+                color: """ + COLORS['text_primary'] + """;
+                font-size: 14px;
+            }
+            QRadioButton::indicator {
+                width: 16px;
+                height: 16px;
+                border: 2px solid """ + COLORS['border'] + """;
+                border-radius: 8px;
+                background-color: """ + COLORS['sidebar'] + """;
+            }
+            QRadioButton::indicator:checked {
+                border: 2px solid """ + COLORS['primary'] + """;
+                background-color: white;
+            }
+        """)
+        
+        layout = QVBoxLayout(dialog)
+        
+        label = QLabel("请选择项目的任务类型:")
+        layout.addWidget(label)
+        
+        # 获取当前任务类型
+        current_task_type = "detect"
+        project = db.get_project(self.current_project_id)
+        if project and project.get('type'):
+            current_task_type = project['type']
+        
+        detect_radio = QRadioButton("detect (目标检测)")
+        if current_task_type == "detect":
+            detect_radio.setChecked(True)
+        layout.addWidget(detect_radio)
+        
+        segment_radio = QRadioButton("segment (实例分割)")
+        if current_task_type == "segment":
+            segment_radio.setChecked(True)
+        layout.addWidget(segment_radio)
+        
+        point_radio = QRadioButton("point (关键点检测)")
+        if current_task_type == "point":
+            point_radio.setChecked(True)
+        layout.addWidget(point_radio)
+        
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("secondary")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        
+        # 确定任务类型
+        if detect_radio.isChecked():
+            task_type = "detect"
+        elif segment_radio.isChecked():
+            task_type = "segment"
+        elif pose_radio.isChecked():
+            task_type = "pose"
+        elif cls_radio.isChecked():
+            task_type = "classify"
+        elif obb_radio.isChecked():
+            task_type = "obb"
+        else:
+            task_type = "detect"
+        
+        # 更新项目的任务类型
+        db.update_project(self.current_project_id, type=task_type)
+        # 更新显示
+        self.update_task_type_display()
     
     def create_new_project(self):
         """创建新项目"""
-        from PyQt6.QtWidgets import QInputDialog
+        from PyQt6.QtWidgets import QInputDialog, QDialog, QVBoxLayout, QHBoxLayout, QRadioButton, QPushButton, QLabel
         
         name, ok = QInputDialog.getText(self, "新建项目", "请输入项目名称:")
-        if ok and name:
-            project_id = db.create_project(
-                name=name,
-                description="",
-                project_type="detection",
-                classes=[]
-            )
-            self.load_projects()
-            index = self.project_combo.findData(project_id)
-            if index >= 0:
-                self.project_combo.setCurrentIndex(index)
+        if not ok or not name:
+            return
+        
+        # 创建任务标签选择对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择任务类型")
+        dialog.setFixedSize(300, 200)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: """ + COLORS['background'] + """;
+            }
+            QLabel {
+                color: """ + COLORS['text_primary'] + """;
+                font-size: 14px;
+            }
+            QRadioButton {
+                color: """ + COLORS['text_primary'] + """;
+                font-size: 14px;
+            }
+            QRadioButton::indicator {
+                width: 16px;
+                height: 16px;
+                border: 2px solid """ + COLORS['border'] + """;
+                border-radius: 8px;
+                background-color: """ + COLORS['sidebar'] + """;
+            }
+            QRadioButton::indicator:checked {
+                border: 2px solid """ + COLORS['primary'] + """;
+                background-color: white;
+            }
+        """)
+        
+        layout = QVBoxLayout(dialog)
+        
+        label = QLabel("请选择项目的任务类型:")
+        layout.addWidget(label)
+        
+        detect_radio = QRadioButton("detect (目标检测)")
+        detect_radio.setChecked(True)
+        layout.addWidget(detect_radio)
+        
+        segment_radio = QRadioButton("segment (实例分割)")
+        layout.addWidget(segment_radio)
+        
+        pose_radio = QRadioButton("pose (关键点检测)")
+        layout.addWidget(pose_radio)
+        
+        cls_radio = QRadioButton("cls (分类)")
+        layout.addWidget(cls_radio)
+        
+        obb_radio = QRadioButton("obb (旋转目标检测)")
+        layout.addWidget(obb_radio)
+        
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("secondary")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        
+        # 确定任务类型
+        if detect_radio.isChecked():
+            task_type = "detect"
+        elif segment_radio.isChecked():
+            task_type = "segment"
+        else:
+            task_type = "point"
+        
+        # 创建项目
+        project_id = db.create_project(
+            name=name,
+            description="",
+            project_type=task_type,
+            classes=[]
+        )
+        self.load_projects()
+        index = self.project_combo.findData(project_id)
+        if index >= 0:
+            self.project_combo.setCurrentIndex(index)
     
     def delete_current_project(self):
         """删除当前选中的项目"""
@@ -614,6 +802,97 @@ class ImportPage(QWidget):
             QMessageBox.warning(self, "提示", "请先选择或创建一个项目")
             return
         
+        # 检查项目是否有任务标签
+        project = db.get_project(self.current_project_id)
+        if not project:
+            QMessageBox.warning(self, "提示", "项目信息获取失败")
+            return
+        
+        task_type = project.get('type')
+        if not task_type or task_type not in ['detect', 'segment', 'pose', 'classify', 'obb']:
+            # 提示选择任务类型
+            from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QRadioButton, QPushButton, QLabel
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle("选择任务类型")
+            dialog.setFixedSize(300, 200)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: """ + COLORS['background'] + """;
+                }
+                QLabel {
+                    color: """ + COLORS['text_primary'] + """;
+                    font-size: 14px;
+                }
+                QRadioButton {
+                    color: """ + COLORS['text_primary'] + """;
+                    font-size: 14px;
+                }
+                QRadioButton::indicator {
+                    width: 16px;
+                    height: 16px;
+                    border: 2px solid """ + COLORS['border'] + """;
+                    border-radius: 8px;
+                    background-color: """ + COLORS['sidebar'] + """;
+                }
+                QRadioButton::indicator:checked {
+                    border: 2px solid """ + COLORS['primary'] + """;
+                    background-color: white;
+                }
+            """)
+            
+            layout = QVBoxLayout(dialog)
+            
+            label = QLabel("请选择项目的任务类型:")
+            layout.addWidget(label)
+            
+            detect_radio = QRadioButton("detect (目标检测)")
+            detect_radio.setChecked(True)
+            layout.addWidget(detect_radio)
+            
+            segment_radio = QRadioButton("segment (实例分割)")
+            layout.addWidget(segment_radio)
+            
+            pose_radio = QRadioButton("pose (关键点检测)")
+            layout.addWidget(pose_radio)
+            
+            cls_radio = QRadioButton("cls (分类)")
+            layout.addWidget(cls_radio)
+            
+            obb_radio = QRadioButton("obb (旋转目标检测)")
+            layout.addWidget(obb_radio)
+            
+            btn_layout = QHBoxLayout()
+            ok_btn = QPushButton("确定")
+            ok_btn.clicked.connect(dialog.accept)
+            cancel_btn = QPushButton("取消")
+            cancel_btn.setObjectName("secondary")
+            cancel_btn.clicked.connect(dialog.reject)
+            btn_layout.addWidget(ok_btn)
+            btn_layout.addWidget(cancel_btn)
+            layout.addLayout(btn_layout)
+            
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            
+            # 确定任务类型
+            if detect_radio.isChecked():
+                task_type = "detect"
+            elif segment_radio.isChecked():
+                task_type = "segment"
+            elif pose_radio.isChecked():
+                task_type = "pose"
+            elif cls_radio.isChecked():
+                task_type = "classify"
+            elif obb_radio.isChecked():
+                task_type = "obb"
+            else:
+                task_type = "detect"
+            
+            # 更新项目的任务类型
+            db.update_project(self.current_project_id, type=task_type)
+        
+        # 选择标注格式
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QRadioButton, QPushButton, QLabel
         
         dialog = QDialog(self)
@@ -702,16 +981,83 @@ class ImportPage(QWidget):
                 QFileDialog.Option.ShowDirsOnly
             )
         
-        try:
-            importer = AnnotationImporter(self.current_project_id)
-            imported, skipped = importer.import_yolo_annotations(labels_dir, images_dir)
-            self.load_project_images()
+        # 检查项目是否已经有标注
+        project_images = db.get_project_images(self.current_project_id)
+        has_annotations = False
+        for image in project_images:
+            annotations = db.get_image_annotations(image['id'])
+            if annotations:
+                has_annotations = True
+                break
+        
+        # 如果有标注，提示是否覆盖
+        overwrite = False
+        if has_annotations:
+            reply = QMessageBox.question(
+                self, "覆盖标注",
+                "项目中已经存在标注，是否覆盖？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                overwrite = True
+        
+        # 显示加载动画
+        self.loading_overlay = LoadingOverlay(self, "正在导入YOLO标注...")
+        self.loading_overlay.show_loading()
+        
+        # 创建后台线程来执行导入操作
+        from PyQt6.QtCore import QThread, pyqtSignal
+        
+        class AnnotationImportThread(QThread):
+            """标注导入线程"""
+            
+            finished = pyqtSignal(bool, str, int, int)
+            
+            def __init__(self, project_id, labels_dir, images_dir, overwrite):
+                super().__init__()
+                self.project_id = project_id
+                self.labels_dir = labels_dir
+                self.images_dir = images_dir
+                self.overwrite = overwrite
+            
+            def run(self):
+                """运行导入"""
+                try:
+                    from core.annotation_importer import AnnotationImporter
+                    importer = AnnotationImporter(self.project_id)
+                    imported, skipped = importer.import_yolo_annotations(
+                        self.labels_dir, self.images_dir, self.overwrite
+                    )
+                    self.finished.emit(True, "导入成功", imported, skipped)
+                except Exception as e:
+                    self.finished.emit(False, f"导入失败: {e}", 0, 0)
+        
+        # 创建并启动线程
+        self.import_thread = AnnotationImportThread(
+            self.current_project_id, labels_dir, images_dir, overwrite
+        )
+        self.import_thread.finished.connect(self.on_annotation_import_finished)
+        self.import_thread.start()
+    
+    def on_annotation_import_finished(self, success, message, imported, skipped):
+        """标注导入完成回调"""
+        # 隐藏加载动画
+        if hasattr(self, 'loading_overlay'):
+            self.loading_overlay.hide_loading()
+            self.loading_overlay.deleteLater()
+            delattr(self, 'loading_overlay')
+        
+        # 重新加载项目图片
+        self.load_project_images()
+        
+        # 显示结果
+        if success:
             QMessageBox.information(
                 self, "导入完成",
                 f"YOLO标注导入完成！\n成功导入: {imported} 个标注\n跳过: {skipped} 个"
             )
-        except Exception as e:
-            QMessageBox.critical(self, "导入失败", f"导入过程中发生错误:\n{str(e)}")
+        else:
+            QMessageBox.critical(self, "导入失败", message)
     
     def import_coco_annotations(self):
         """导入COCO标注"""
@@ -723,16 +1069,62 @@ class ImportPage(QWidget):
         if not file_path:
             return
         
-        try:
-            importer = AnnotationImporter(self.current_project_id)
-            imported, skipped = importer.import_coco_annotations(file_path)
-            self.load_project_images()
-            QMessageBox.information(
-                self, "导入完成",
-                f"COCO标注导入完成！\n成功导入: {imported} 个标注\n跳过: {skipped} 个"
+        # 检查项目是否已经有标注
+        project_images = db.get_project_images(self.current_project_id)
+        has_annotations = False
+        for image in project_images:
+            annotations = db.get_image_annotations(image['id'])
+            if annotations:
+                has_annotations = True
+                break
+        
+        # 如果有标注，提示是否覆盖
+        overwrite = False
+        if has_annotations:
+            reply = QMessageBox.question(
+                self, "覆盖标注",
+                "项目中已经存在标注，是否覆盖？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-        except Exception as e:
-            QMessageBox.critical(self, "导入失败", f"导入过程中发生错误:\n{str(e)}")
+            if reply == QMessageBox.StandardButton.Yes:
+                overwrite = True
+        
+        # 显示加载动画
+        self.loading_overlay = LoadingOverlay(self, "正在导入COCO标注...")
+        self.loading_overlay.show_loading()
+        
+        # 创建后台线程来执行导入操作
+        from PyQt6.QtCore import QThread, pyqtSignal
+        
+        class AnnotationImportThread(QThread):
+            """标注导入线程"""
+            
+            finished = pyqtSignal(bool, str, int, int)
+            
+            def __init__(self, project_id, file_path, overwrite):
+                super().__init__()
+                self.project_id = project_id
+                self.file_path = file_path
+                self.overwrite = overwrite
+            
+            def run(self):
+                """运行导入"""
+                try:
+                    from core.annotation_importer import AnnotationImporter
+                    importer = AnnotationImporter(self.project_id)
+                    imported, skipped = importer.import_coco_annotations(
+                        self.file_path, self.overwrite
+                    )
+                    self.finished.emit(True, "导入成功", imported, skipped)
+                except Exception as e:
+                    self.finished.emit(False, f"导入失败: {e}", 0, 0)
+        
+        # 创建并启动线程
+        self.import_thread = AnnotationImportThread(
+            self.current_project_id, file_path, overwrite
+        )
+        self.import_thread.finished.connect(self.on_annotation_import_finished)
+        self.import_thread.start()
     
     def import_voc_annotations(self):
         """导入VOC标注"""
@@ -744,16 +1136,62 @@ class ImportPage(QWidget):
         if not voc_dir:
             return
         
-        try:
-            importer = AnnotationImporter(self.current_project_id)
-            imported, skipped = importer.import_voc_annotations(voc_dir)
-            self.load_project_images()
-            QMessageBox.information(
-                self, "导入完成",
-                f"VOC标注导入完成！\n成功导入: {imported} 个标注\n跳过: {skipped} 个"
+        # 检查项目是否已经有标注
+        project_images = db.get_project_images(self.current_project_id)
+        has_annotations = False
+        for image in project_images:
+            annotations = db.get_image_annotations(image['id'])
+            if annotations:
+                has_annotations = True
+                break
+        
+        # 如果有标注，提示是否覆盖
+        overwrite = False
+        if has_annotations:
+            reply = QMessageBox.question(
+                self, "覆盖标注",
+                "项目中已经存在标注，是否覆盖？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-        except Exception as e:
-            QMessageBox.critical(self, "导入失败", f"导入过程中发生错误:\n{str(e)}")
+            if reply == QMessageBox.StandardButton.Yes:
+                overwrite = True
+        
+        # 显示加载动画
+        self.loading_overlay = LoadingOverlay(self, "正在导入VOC标注...")
+        self.loading_overlay.show_loading()
+        
+        # 创建后台线程来执行导入操作
+        from PyQt6.QtCore import QThread, pyqtSignal
+        
+        class AnnotationImportThread(QThread):
+            """标注导入线程"""
+            
+            finished = pyqtSignal(bool, str, int, int)
+            
+            def __init__(self, project_id, voc_dir, overwrite):
+                super().__init__()
+                self.project_id = project_id
+                self.voc_dir = voc_dir
+                self.overwrite = overwrite
+            
+            def run(self):
+                """运行导入"""
+                try:
+                    from core.annotation_importer import AnnotationImporter
+                    importer = AnnotationImporter(self.project_id)
+                    imported, skipped = importer.import_voc_annotations(
+                        self.voc_dir, self.overwrite
+                    )
+                    self.finished.emit(True, "导入成功", imported, skipped)
+                except Exception as e:
+                    self.finished.emit(False, f"导入失败: {e}", 0, 0)
+        
+        # 创建并启动线程
+        self.import_thread = AnnotationImportThread(
+            self.current_project_id, voc_dir, overwrite
+        )
+        self.import_thread.finished.connect(self.on_annotation_import_finished)
+        self.import_thread.start()
     
     def process_folder_import(self, folder_path: str):
         """处理文件夹导入"""

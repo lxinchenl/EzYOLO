@@ -89,11 +89,21 @@ class ModelManager:
         model_info = ULTRALYTICS_MODELS[version]
         prefix = model_info["prefix"]
         
+        # 任务类型到后缀的映射
+        task_suffix_map = {
+            "segment": "seg",
+            "classify": "cls",
+            "pose": "pose",
+            "obb": "obb",
+            "world": "world"
+        }
+        
         # 构建模型文件名
         if task == "detect":
             model_name = f"{prefix}{size}.pt"
         else:
-            model_name = f"{prefix}{size}-{task}.pt"
+            suffix = task_suffix_map.get(task, task)
+            model_name = f"{prefix}{size}-{suffix}.pt"
         
         model_path = self.pretrained_dir / model_name
         return model_path
@@ -125,11 +135,21 @@ class ModelManager:
                 model = YOLO(str(model_path))
             else:
                 # 本地不存在，尝试在线下载
+                # 任务类型到后缀的映射
+                task_suffix_map = {
+                    "segment": "seg",
+                    "classify": "cls",
+                    "pose": "pose",
+                    "obb": "obb",
+                    "world": "world"
+                }
+                
                 # 构建模型名称
                 if task == "detect":
                     model_name = f"{version.lower()}{size}"
                 else:
-                    model_name = f"{version.lower()}{size}-{task}"
+                    suffix = task_suffix_map.get(task, task)
+                    model_name = f"{version.lower()}{size}-{suffix}"
                 
                 # 设置环境变量，指定模型下载路径
                 import os

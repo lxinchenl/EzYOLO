@@ -149,11 +149,21 @@ class TrainingThread(QThread):
         model_size = self.config['model_size']
         task = self.config['task']
         
+        # 任务类型到后缀的映射
+        task_suffix_map = {
+            "segment": "seg",
+            "classify": "cls",
+            "pose": "pose",
+            "obb": "obb",
+            "world": "world"
+        }
+        
         # 构建模型文件名
         if task == 'detect':
             model_name = f"{model_prefix}{model_size}.pt"
         else:
-            model_name = f"{model_prefix}{model_size}-{task}.pt"
+            suffix = task_suffix_map.get(task, task)
+            model_name = f"{model_prefix}{model_size}-{suffix}.pt"
         
         # 从pretrained目录加载（使用相对路径）
         import os
@@ -419,9 +429,6 @@ class TrainingThread(QThread):
                             with open(label_file, 'w') as f:
                                 for ann in annotations:
                                     ann_type = ann.get('type', 'unknown')
-                                    if ann_type != 'bbox':
-                                        continue
-                                    
                                     data = ann.get('data', {})
                                     if not data:
                                         continue
@@ -429,20 +436,75 @@ class TrainingThread(QThread):
                                     # 转换为YOLO格式 - 直接从img字典获取图片尺寸
                                     img_w = img.get('width', 640)
                                     img_h = img.get('height', 480)
-                                    
-                                    x = data.get('x', 0)
-                                    y = data.get('y', 0)
-                                    w = data.get('width', 0)
-                                    h = data.get('height', 0)
-                                    
-                                    x_center = (x + w / 2) / img_w
-                                    y_center = (y + h / 2) / img_h
-                                    width = w / img_w
-                                    height = h / img_h
-                                    
                                     class_id = ann.get('class_id', 0)
-                                    line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n"
-                                    f.write(line)
+                                    
+                                    # 根据标注类型生成不同格式的标注
+                                    if ann_type == 'bbox':
+                                        # 边界框标注
+                                        x = data.get('x', 0)
+                                        y = data.get('y', 0)
+                                        w = data.get('width', 0)
+                                        h = data.get('height', 0)
+                                        
+                                        x_center = (x + w / 2) / img_w
+                                        y_center = (y + h / 2) / img_h
+                                        width = w / img_w
+                                        height = h / img_h
+                                        
+                                        line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n"
+                                        f.write(line)
+                                    elif ann_type == 'polygon':
+                                        # 多边形标注（用于segment任务）
+                                        points = data.get('points', [])
+                                        if points:
+                                            # 写入类别ID
+                                            line = f"{class_id} "
+                                            # 写入多边形点
+                                            for point in points:
+                                                px = point.get('x', 0) / img_w
+                                                py = point.get('y', 0) / img_h
+                                                line += f"{px:.6f} {py:.6f} "
+                                            line += "\n"
+                                            f.write(line)
+                                    elif ann_type == 'keypoint':
+                                        # 关键点标注（用于pose任务）
+                                        x = data.get('x', 0)
+                                        y = data.get('y', 0)
+                                        w = data.get('width', 0)
+                                        h = data.get('height', 0)
+                                        keypoints = data.get('keypoints', [])
+                                        
+                                        x_center = (x + w / 2) / img_w
+                                        y_center = (y + h / 2) / img_h
+                                        width = w / img_w
+                                        height = h / img_h
+                                        
+                                        # 写入边界框
+                                        line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} "
+                                        
+                                        # 写入关键点
+                                        for kp in keypoints:
+                                            kp_x = kp.get('x', 0) / img_w
+                                            kp_y = kp.get('y', 0) / img_h
+                                            kp_v = kp.get('v', 1)
+                                            line += f"{kp_x:.6f} {kp_y:.6f} {kp_v} "
+                                        line += "\n"
+                                        f.write(line)
+                                    elif ann_type == 'obb':
+                                        # 旋转框标注（用于obb任务）
+                                        x = data.get('x', 0)
+                                        y = data.get('y', 0)
+                                        w = data.get('width', 0)
+                                        h = data.get('height', 0)
+                                        angle = data.get('angle', 0)
+                                        
+                                        x_center = (x + w / 2) / img_w
+                                        y_center = (y + h / 2) / img_h
+                                        width = w / img_w
+                                        height = h / img_h
+                                        
+                                        line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} {angle:.6f}\n"
+                                        f.write(line)
                         except Exception:
                             pass
             
