@@ -443,10 +443,7 @@ class ImportPage(QWidget):
             classify_radio.setChecked(True)
         layout.addWidget(classify_radio)
         
-        obb_radio = QRadioButton("obb (旋转目标检测)")
-        if current_task_type == "obb":
-            obb_radio.setChecked(True)
-        layout.addWidget(obb_radio)
+
         
         btn_layout = QHBoxLayout()
         ok_btn = QPushButton("确定")
@@ -470,8 +467,7 @@ class ImportPage(QWidget):
             task_type = "pose"
         elif classify_radio.isChecked():
             task_type = "classify"
-        elif obb_radio.isChecked():
-            task_type = "obb"
+
         else:
             task_type = "detect"
         
@@ -535,8 +531,7 @@ class ImportPage(QWidget):
         classify_radio = QRadioButton("classify (图像分类)")
         layout.addWidget(classify_radio)
         
-        obb_radio = QRadioButton("obb (旋转目标检测)")
-        layout.addWidget(obb_radio)
+
         
         btn_layout = QHBoxLayout()
         ok_btn = QPushButton("确定")
@@ -560,8 +555,7 @@ class ImportPage(QWidget):
             task_type = "pose"
         elif classify_radio.isChecked():
             task_type = "classify"
-        elif obb_radio.isChecked():
-            task_type = "obb"
+
         else:
             task_type = "detect"
         
@@ -599,8 +593,21 @@ class ImportPage(QWidget):
         
         if reply == QMessageBox.StandardButton.Yes:
             try:
+                # 获取项目信息，包括存储路径
+                project = db.get_project(project_id)
+                project_storage_path = project.get('storage_path', '') if project else ''
+                
                 # 删除项目（数据库会自动级联删除相关图片和标注）
                 db.delete_project(project_id)
+                
+                # 删除项目文件夹
+                if project_storage_path and os.path.exists(project_storage_path):
+                    try:
+                        import shutil
+                        shutil.rmtree(project_storage_path)
+                    except Exception as e:
+                        # 文件夹删除失败不影响项目删除
+                        print(f"删除项目文件夹失败: {e}")
                 
                 # 清空当前项目ID
                 self.current_project_id = None
@@ -825,7 +832,7 @@ class ImportPage(QWidget):
             return
         
         task_type = project.get('type')
-        if not task_type or task_type not in ['detect', 'segment', 'pose', 'classify', 'obb']:
+        if not task_type or task_type not in ['detect', 'segment', 'pose', 'classify']:
             # 提示选择任务类型
             from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QRadioButton, QPushButton, QLabel
             
@@ -875,8 +882,7 @@ class ImportPage(QWidget):
             cls_radio = QRadioButton("cls (分类)")
             layout.addWidget(cls_radio)
             
-            obb_radio = QRadioButton("obb (旋转目标检测)")
-            layout.addWidget(obb_radio)
+
             
             btn_layout = QHBoxLayout()
             ok_btn = QPushButton("确定")
@@ -900,8 +906,7 @@ class ImportPage(QWidget):
                 task_type = "pose"
             elif cls_radio.isChecked():
                 task_type = "classify"
-            elif obb_radio.isChecked():
-                task_type = "obb"
+
             else:
                 task_type = "detect"
             

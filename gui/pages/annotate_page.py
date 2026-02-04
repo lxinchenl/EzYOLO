@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QCheckBox, QSlider, QTextEdit, QInputDialog,
     QColorDialog, QDialog
 )
+import math
 
 # 导入自动标注相关模块
 from gui.pages.auto_label_dialog import AutoLabelDialog
@@ -109,6 +110,14 @@ class AnnotationCanvas(QFrame):
         
         # 多边形绘制
         self.polygon_points = []
+        
+        # 关键点绘制
+        self.keypoints = []
+        self.drawing_keypoint = False
+        
+        # OBB绘制状态
+        self.obb_state = 0  # 0: 未开始, 1: 已确定第一个点, 2: 已确定第一条边
+        self.obb_points = []
         
         # 编辑状态
         self.editing = False
@@ -209,6 +218,9 @@ class AnnotationCanvas(QFrame):
         self.current_tool = tool
         self.drawing = False
         self.polygon_points = []
+        # 清除关键点绘制状态
+        if hasattr(self, 'keypoints'):
+            self.keypoints = []
         self.update()
     
     def image_to_widget(self, x: float, y: float) -> QPoint:
@@ -257,6 +269,10 @@ class AnnotationCanvas(QFrame):
         # 绘制正在绘制的多边形
         if self.current_tool == 'polygon' and len(self.polygon_points) > 0:
             self.draw_drawing_polygon(painter)
+        
+        # 绘制正在绘制的旋转矩形
+        if self.current_tool == 'obb' and len(self.obb_points) > 0:
+            self.draw_drawing_obb(painter)
         
         # 绘制鼠标辅助线
         if self.current_image and self.current_point:
@@ -319,6 +335,10 @@ class AnnotationCanvas(QFrame):
                 self.draw_bbox(painter, data, is_selected)
             elif ann_type == 'polygon':
                 self.draw_polygon(painter, data, is_selected)
+            elif ann_type == 'keypoint':
+                self.draw_keypoints(painter, data, is_selected)
+            elif ann_type == 'obb':
+                self.draw_obb(painter, data, is_selected)
     
     def draw_bbox(self, painter: QPainter, data: Dict, is_selected: bool):
         """绘制矩形框"""
@@ -357,6 +377,84 @@ class AnnotationCanvas(QFrame):
         # 绘制顶点
         for point in widget_points:
             painter.drawEllipse(point, 4, 4)
+    
+    def draw_keypoints(self, painter: QPainter, data: Dict, is_selected: bool):
+        """绘制关键点"""
+        keypoints = data.get('keypoints', [])
+        if not keypoints:
+            return
+        
+        # 绘制关键点之间的连接线
+        if len(keypoints) > 1:
+            for i in range(len(keypoints) - 1):
+                kp1 = keypoints[i]
+                kp2 = keypoints[i + 1]
+                if kp1.get('visible', 1) and kp2.get('visible', 1):
+                    p1 = self.image_to_widget(kp1['x'], kp1['y'])
+                    p2 = self.image_to_widget(kp2['x'], kp2['y'])
+                    painter.drawLine(p1, p2)
+        
+        # 绘制关键点
+        for kp in keypoints:
+            if kp.get('visible', 1):
+                point = self.image_to_widget(kp['x'], kp['y'])
+                # 绘制关键点圆圈
+                radius = 6 if is_selected else 4
+                painter.drawEllipse(point, radius, radius)
+                # 绘制关键点索引（如果有）
+                if 'id' in kp:
+                    painter.drawText(point.x() + radius + 2, point.y() - radius, str(kp['id']))
+    
+    def draw_obb(self, painter: QPainter, data: Dict, is_selected: bool):
+        """绘制旋转矩形"""
+        x = data.get('x', 0)
+        y = data.get('y', 0)
+        width = data.get('width', 0)
+        height = data.get('height', 0)
+        angle = data.get('angle', 0)  # 旋转角度（弧度）
+        
+        # 计算矩形的四个顶点
+        center = self.image_to_widget(x, y)
+        half_width = width * self.image_scale / 2
+        half_height = height * self.image_scale / 2
+        
+        # 计算四个顶点
+        import math
+        points = []
+        # 定义四个顶点相对于中心点的基础偏移（未旋转时）
+        # 顺序：p1, p2, p3, p4 对应 create_obb_annotation_with_points 中的四个点
+        base_offsets = [
+            (half_width, -half_height),  # p1: 右上
+            (-half_width, -half_height),  # p2: 左上
+            (-half_width, half_height),   # p3: 左下
+            (half_width, half_height)     # p4: 右下
+        ]
+        
+        for dx, dy in base_offsets:
+            # 应用旋转
+            rotated_dx = dx * math.cos(angle) - dy * math.sin(angle)
+            rotated_dy = dx * math.sin(angle) + dy * math.cos(angle)
+            # 计算最终顶点坐标
+            vertex_x = center.x() + rotated_dx
+            vertex_y = center.y() + rotated_dy
+            points.append(QPoint(int(vertex_x), int(vertex_y)))
+        
+        # 绘制旋转矩形
+        for i in range(4):
+            p1 = points[i]
+            p2 = points[(i + 1) % 4]
+            painter.drawLine(p1, p2)
+        
+        # 如果是选中状态，绘制调整手柄
+        if is_selected:
+            for point in points:
+                handle_rect = QRect(
+                    point.x() - self.handle_size // 2,
+                    point.y() - self.handle_size // 2,
+                    self.handle_size,
+                    self.handle_size
+                )
+                painter.drawRect(handle_rect)
     
     def draw_resize_handles(self, painter: QPainter, rect: QRect):
         """绘制调整大小的手柄"""
@@ -413,6 +511,98 @@ class AnnotationCanvas(QFrame):
         # 绘制从最后一点到当前鼠标的线
         if len(self.polygon_points) > 0 and self.current_point:
             painter.drawLine(self.polygon_points[-1], self.current_point)
+    
+    def draw_drawing_obb(self, painter: QPainter):
+        """绘制正在绘制的旋转矩形"""
+        if len(self.obb_points) == 0:
+            return
+        
+        # 设置绘制样式
+        pen = QPen(QColor(COLORS['primary']))
+        pen.setWidth(2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        
+        # 使用主色调的半透明版本
+        primary_color = QColor(COLORS['primary'])
+        primary_color.setAlpha(50)
+        painter.setBrush(QBrush(primary_color))
+        
+        if len(self.obb_points) == 1:
+            # 只绘制第一个点
+            point = self.obb_points[0]
+            painter.drawEllipse(point, 4, 4)
+        elif len(self.obb_points) == 2:
+            # 绘制第一条边
+            p1 = self.obb_points[0]
+            p2 = self.obb_points[1]
+            painter.drawLine(p1, p2)
+            painter.drawEllipse(p1, 4, 4)
+            painter.drawEllipse(p2, 4, 4)
+            # 如果有鼠标位置，绘制辅助线、垂线和半透明OBB
+            if self.current_point:
+                # 计算垂直线
+                dx = p2.x() - p1.x()
+                dy = p2.y() - p1.y()
+                # 计算垂线方向向量
+                perp_dx = -dy
+                perp_dy = dx
+                # 归一化
+                length = math.sqrt(perp_dx ** 2 + perp_dy ** 2)
+                if length > 0:
+                    perp_dx /= length
+                    perp_dy /= length
+                # 绘制垂线
+                perp_p1 = QPoint(int(p2.x() + perp_dx * 100), int(p2.y() + perp_dy * 100))
+                perp_p2 = QPoint(int(p2.x() - perp_dx * 100), int(p2.y() - perp_dy * 100))
+                painter.setPen(QPen(QColor(COLORS['primary']), 1, Qt.PenStyle.DotLine))
+                painter.drawLine(perp_p1, perp_p2)
+                # 计算垂线上的点（鼠标位置在垂线上的投影）
+                mouse_dx = self.current_point.x() - p2.x()
+                mouse_dy = self.current_point.y() - p2.y()
+                # 计算投影长度
+                proj_length = mouse_dx * perp_dx + mouse_dy * perp_dy
+                # 计算垂线上的点
+                perp_point = QPoint(int(p2.x() + perp_dx * proj_length), int(p2.y() + perp_dy * proj_length))
+                # 计算第四个点
+                p4 = QPoint(int(p1.x() + (perp_point.x() - p2.x())), int(p1.y() + (perp_point.y() - p2.y())))
+                # 绘制OBB
+                painter.setPen(QPen(QColor(COLORS['primary']), 2, Qt.PenStyle.DashLine))
+                painter.drawLine(p1, p2)
+                painter.drawLine(p2, perp_point)
+                painter.drawLine(perp_point, p4)
+                painter.drawLine(p4, p1)
+                # 绘制所有点
+                painter.drawEllipse(p1, 4, 4)
+                painter.drawEllipse(p2, 4, 4)
+                painter.drawEllipse(perp_point, 4, 4)
+                painter.drawEllipse(p4, 4, 4)
+                # 绘制鼠标到垂点的辅助线
+                painter.setPen(QPen(QColor(COLORS['primary']), 1, Qt.PenStyle.DotLine))
+                painter.drawLine(self.current_point, perp_point)
+                painter.setPen(QPen(QColor(COLORS['primary']), 2, Qt.PenStyle.DashLine))
+        elif len(self.obb_points) == 3:
+            # 绘制完整的OBB
+            p1 = self.obb_points[0]
+            p2 = self.obb_points[1]
+            p3 = self.obb_points[2]
+            
+            # 计算第四个点
+            dx = p3.x() - p2.x()
+            dy = p3.y() - p2.y()
+            p4 = QPoint(p1.x() + dx, p1.y() + dy)
+            
+            # 绘制OBB
+            painter.drawLine(p1, p2)
+            painter.drawLine(p2, p3)
+            painter.drawLine(p3, p4)
+            painter.drawLine(p4, p1)
+            
+            # 绘制所有点
+            painter.drawEllipse(p1, 4, 4)
+            painter.drawEllipse(p2, 4, 4)
+            painter.drawEllipse(p3, 4, 4)
+            painter.drawEllipse(p4, 4, 4)
     
     def draw_guide_lines(self, painter: QPainter):
         """绘制鼠标辅助线"""
@@ -481,8 +671,92 @@ class AnnotationCanvas(QFrame):
                 self.start_point = event.pos()
                 self.current_point = event.pos()
             elif self.current_tool == 'polygon':
+                # 检查是否是吸附到初始点的情况
+                if len(self.polygon_points) > 0:
+                    initial_point = self.polygon_points[0]
+                    distance = (event.pos() - initial_point).manhattanLength()
+                    # 如果距离小于吸附阈值，完成多边形标注
+                    if distance < 10:
+                        self.create_polygon_annotation()
+                        return
+                # 否则添加新点
                 self.polygon_points.append(event.pos())
                 self.update()
+            elif self.current_tool == 'keypoint':
+                # 转换为图像坐标
+                x, y = self.widget_to_image(event.pos().x(), event.pos().y())
+                
+                # 限制坐标在图像范围内
+                if self.current_image:
+                    img_width = self.current_image.width()
+                    img_height = self.current_image.height()
+                    x = max(0, min(x, img_width))
+                    y = max(0, min(y, img_height))
+                
+                # 创建关键点标注
+                keypoint = {
+                    'x': x,
+                    'y': y,
+                    'visible': 1
+                }
+                
+                # 添加到关键点列表
+                self.keypoints.append(keypoint)
+                
+                # 如果已经有多个关键点，创建标注
+                if len(self.keypoints) >= 1:
+                    annotation = {
+                        'type': 'keypoint',
+                        'class_id': self.current_class_id,
+                        'data': {
+                            'keypoints': self.keypoints.copy()
+                        }
+                    }
+                    self.annotation_created.emit(annotation)
+                    # 重置关键点列表，准备下一个标注
+                    self.keypoints = []
+            elif self.current_tool == 'obb':
+                if self.obb_state == 0:
+                    # 第一步：确定第一个点（固定角度的起始点）
+                    self.obb_state = 1
+                    self.obb_points = [event.pos()]
+                    self.update()
+                elif self.obb_state == 1:
+                    # 第二步：确定第一条边的另一个端点
+                    self.obb_state = 2
+                    self.obb_points.append(event.pos())
+                    self.update()
+                elif self.obb_state == 2:
+                    # 第三步：确定邻边的另一个端点，完成OBB创建
+                    # 计算垂线上的点（与draw_drawing_obb方法相同的逻辑）
+                    p1 = self.obb_points[0]
+                    p2 = self.obb_points[1]
+                    # 计算垂直线
+                    dx = p2.x() - p1.x()
+                    dy = p2.y() - p1.y()
+                    # 计算垂线方向向量
+                    perp_dx = -dy
+                    perp_dy = dx
+                    # 归一化
+                    length = math.sqrt(perp_dx ** 2 + perp_dy ** 2)
+                    if length > 0:
+                        perp_dx /= length
+                        perp_dy /= length
+                    # 计算从p2到当前鼠标的向量
+                    mouse_dx = event.pos().x() - p2.x()
+                    mouse_dy = event.pos().y() - p2.y()
+                    # 计算投影长度
+                    proj_length = mouse_dx * perp_dx + mouse_dy * perp_dy
+                    # 计算垂线上的点
+                    perp_point = QPoint(int(p2.x() + perp_dx * proj_length), int(p2.y() + perp_dy * proj_length))
+                    # 将垂线上的点添加到obb_points列表中
+                    self.obb_points.append(perp_point)
+                    # 创建OBB标注
+                    self.create_obb_annotation_with_points()
+                    # 重置状态
+                    self.obb_state = 0
+                    self.obb_points = []
+                    self.update()
             elif self.current_tool == 'move':
                 # 检查是否点击了调整手柄
                 handle_info = self.get_resize_handle_at(event.pos())
@@ -503,7 +777,16 @@ class AnnotationCanvas(QFrame):
                         self.selected_annotation_id = clicked_annotation['id']
                         self.dragging = True
                         self.drag_start = event.pos()
-                        self.drag_start_annotation = clicked_annotation['data'].copy()
+                        # 深度复制标注数据，特别是多边形的点
+                        ann_type = clicked_annotation.get('type', 'bbox')
+                        ann_data = clicked_annotation['data']
+                        if ann_type == 'polygon' and 'points' in ann_data:
+                            # 对多边形点进行深度复制
+                            self.drag_start_annotation = {'points': []}
+                            for point in ann_data['points']:
+                                self.drag_start_annotation['points'].append(point.copy())
+                        else:
+                            self.drag_start_annotation = ann_data.copy()
                         self.annotation_selected.emit(self.selected_annotation_id)
                     else:
                         # 没有点击标注，开始平移图片
@@ -516,7 +799,17 @@ class AnnotationCanvas(QFrame):
     
     def mouseMoveEvent(self, event: QMouseEvent):
         """鼠标移动事件"""
-        self.current_point = event.pos()
+        # 多边形标注：添加初始点吸附效果
+        if self.current_tool == 'polygon' and len(self.polygon_points) > 0:
+            initial_point = self.polygon_points[0]
+            distance = (event.pos() - initial_point).manhattanLength()
+            # 吸附阈值：10像素
+            if distance < 10:
+                self.current_point = initial_point
+            else:
+                self.current_point = event.pos()
+        else:
+            self.current_point = event.pos()
         
         if self.drawing and self.current_tool == 'rectangle':
             self.update()
@@ -571,6 +864,9 @@ class AnnotationCanvas(QFrame):
             if self.drawing and self.current_tool == 'rectangle':
                 self.drawing = False
                 self.create_rectangle_annotation()
+            elif self.drawing and self.current_tool == 'obb':
+                self.drawing = False
+                self.create_obb_annotation()
             elif self.resizing:
                 self.resizing = False
                 self.resize_handle = None
@@ -681,13 +977,40 @@ class AnnotationCanvas(QFrame):
             data['x'] = max(0, min(new_x, img_width - width))
             data['y'] = max(0, min(new_y, img_height - height))
         elif ann_type == 'polygon':
-            start_points = self.drag_start_annotation['points']
-            for i, point in enumerate(data['points']):
-                new_x = start_points[i]['x'] + img_delta_x
-                new_y = start_points[i]['y'] + img_delta_y
+            # 确保drag_start_annotation包含正确的点数据
+            if 'points' in self.drag_start_annotation and 'points' in data:
+                start_points = self.drag_start_annotation['points']
+                # 确保点的数量匹配
+                if len(start_points) == len(data['points']):
+                    for i, point in enumerate(data['points']):
+                        if i < len(start_points):
+                            # 直接使用原始点加上偏移量，避免累积误差
+                            new_x = start_points[i]['x'] + img_delta_x
+                            new_y = start_points[i]['y'] + img_delta_y
+                            # 限制在图像范围内
+                            point['x'] = max(0, min(new_x, img_width))
+                            point['y'] = max(0, min(new_y, img_height))
+        elif ann_type == 'obb':
+            # 确保drag_start_annotation包含正确的OBB数据
+            if 'x' in self.drag_start_annotation and 'y' in self.drag_start_annotation:
+                new_x = self.drag_start_annotation['x'] + img_delta_x
+                new_y = self.drag_start_annotation['y'] + img_delta_y
                 # 限制在图像范围内
-                point['x'] = max(0, min(new_x, img_width))
-                point['y'] = max(0, min(new_y, img_height))
+                data['x'] = max(0, min(new_x, img_width))
+                data['y'] = max(0, min(new_y, img_height))
+        elif ann_type == 'keypoint':
+            # 确保drag_start_annotation包含正确的关键点数据
+            if 'keypoints' in self.drag_start_annotation and 'keypoints' in data:
+                start_keypoints = self.drag_start_annotation['keypoints']
+                # 确保关键点数量匹配
+                if len(start_keypoints) == len(data['keypoints']):
+                    for i, kp in enumerate(data['keypoints']):
+                        if i < len(start_keypoints):
+                            new_x = start_keypoints[i]['x'] + img_delta_x
+                            new_y = start_keypoints[i]['y'] + img_delta_y
+                            # 限制在图像范围内
+                            kp['x'] = max(0, min(new_x, img_width))
+                            kp['y'] = max(0, min(new_y, img_height))
     
     def resize_annotation(self, pos: QPoint):
         """调整标注大小"""
@@ -863,6 +1186,25 @@ class AnnotationCanvas(QFrame):
             
             # 使用射线法检测点是否在多边形内
             return self.point_in_polygon(pos.x(), pos.y(), widget_points)
+        elif ann_type == 'obb':
+            # 计算OBB的四个顶点
+            x = data.get('x', 0)
+            y = data.get('y', 0)
+            width = data.get('width', 0)
+            height = data.get('height', 0)
+            angle = data.get('angle', 0)
+            
+            # 转换为控件坐标的四个顶点
+            widget_points = []
+            for i in range(4):
+                vertex_angle = angle + i * math.pi / 2
+                vertex_x = x + width * math.cos(vertex_angle) - height * math.sin(vertex_angle)
+                vertex_y = y + width * math.sin(vertex_angle) + height * math.cos(vertex_angle)
+                widget_point = self.image_to_widget(vertex_x, vertex_y)
+                widget_points.append((widget_point.x(), widget_point.y()))
+            
+            # 使用射线法检测点是否在OBB内
+            return self.point_in_polygon(pos.x(), pos.y(), widget_points)
         
         return False
     
@@ -960,6 +1302,86 @@ class AnnotationCanvas(QFrame):
         self.annotation_created.emit(annotation)
         self.polygon_points = []
     
+    def create_obb_annotation_with_points(self):
+        """根据三个点创建旋转矩形标注"""
+        if len(self.obb_points) != 3:
+            return
+        
+        # 转换为图像坐标
+        p1 = self.obb_points[0]
+        p2 = self.obb_points[1]
+        p3 = self.obb_points[2]
+        
+        # 转换控件坐标为图像坐标
+        x1, y1 = self.widget_to_image(p1.x(), p1.y())
+        x2, y2 = self.widget_to_image(p2.x(), p2.y())
+        x3, y3 = self.widget_to_image(p3.x(), p3.y())
+        
+        # 计算向量
+        vec1 = (x2 - x1, y2 - y1)
+        
+        # 计算垂线方向向量
+        perp_dx = -vec1[1]
+        perp_dy = vec1[0]
+        
+        # 归一化
+        length = math.sqrt(perp_dx ** 2 + perp_dy ** 2)
+        if length > 0:
+            perp_dx /= length
+            perp_dy /= length
+        
+        # 计算从p2到p3的向量
+        vec3 = (x3 - x2, y3 - y2)
+        
+        # 计算投影长度
+        proj_length = vec3[0] * perp_dx + vec3[1] * perp_dy
+        
+        # 计算垂线上的点
+        perp_x = x2 + perp_dx * proj_length
+        perp_y = y2 + perp_dy * proj_length
+        
+        # 计算第四个点
+        x4 = x1 + (perp_x - x2)
+        y4 = y1 + (perp_y - y2)
+        
+        # 计算宽度和高度
+        width = math.sqrt(vec1[0] ** 2 + vec1[1] ** 2)
+        height = math.sqrt((perp_x - x2) ** 2 + (perp_y - y2) ** 2)
+        
+        # 计算旋转角度（弧度）
+        angle = math.atan2(vec1[1], vec1[0])
+        
+        # 计算中心点
+        center_x = (x1 + x2 + perp_x + x4) / 4
+        center_y = (y1 + y2 + perp_y + y4) / 4
+        
+        # 限制坐标在图像范围内
+        if self.current_image:
+            img_width = self.current_image.width()
+            img_height = self.current_image.height()
+            center_x = max(0, min(center_x, img_width))
+            center_y = max(0, min(center_y, img_height))
+            width = min(width, img_width)
+            height = min(height, img_height)
+        
+        # 过滤太小的标注
+        if width < 5 or height < 5:
+            return
+        
+        annotation = {
+            'type': 'obb',
+            'class_id': self.current_class_id,
+            'data': {
+                'x': center_x,
+                'y': center_y,
+                'width': width,
+                'height': height,
+                'angle': angle
+            }
+        }
+        
+        self.annotation_created.emit(annotation)
+    
     def resizeEvent(self, event):
         """窗口大小改变"""
         super().resizeEvent(event)
@@ -1048,7 +1470,7 @@ class AnnotatePage(QWidget):
         task_layout.addWidget(task_label)
         
         self.task_combo = QComboBox()
-        self.task_combo.addItems(["detect", "segment", "pose", "classify", "obb"])
+        self.task_combo.addItems(["detect", "segment", "pose", "classify"])
         self.task_combo.currentTextChanged.connect(self.on_task_changed)
         task_layout.addWidget(self.task_combo)
         layout.addLayout(task_layout)
@@ -1112,6 +1534,10 @@ class AnnotatePage(QWidget):
         self.canvas.annotation_deleted.connect(self.on_annotation_deleted)
         layout.addWidget(self.canvas, stretch=1)
         
+        # 初始化时根据当前任务类型调整工具按钮的可见性
+        current_task = self.task_combo.currentText()
+        self.adjust_tool_visibility(current_task)
+        
         return panel
     
     def create_toolbar(self) -> QToolBar:
@@ -1131,22 +1557,39 @@ class AnnotatePage(QWidget):
         self.tool_group.setExclusive(True)
         
         # 矩形工具
-        self.btn_rectangle = QPushButton("🟦 矩形 (W)")
+        self.btn_rectangle = QPushButton("🟦 矩形")
         self.btn_rectangle.setCheckable(True)
-        self.btn_rectangle.setChecked(True)
         self.btn_rectangle.clicked.connect(lambda: self.set_tool('rectangle'))
         toolbar.addWidget(self.btn_rectangle)
+        self.btn_rectangle.hide()  # 默认隐藏
         self.tool_group.addButton(self.btn_rectangle)
         
         # 多边形工具
-        self.btn_polygon = QPushButton("🛑 多边形 (P)")
+        self.btn_polygon = QPushButton("🛑 多边形")
         self.btn_polygon.setCheckable(True)
         self.btn_polygon.clicked.connect(lambda: self.set_tool('polygon'))
         toolbar.addWidget(self.btn_polygon)
+        self.btn_polygon.hide()  # 默认隐藏
         self.tool_group.addButton(self.btn_polygon)
         
+        # 关键点工具
+        self.btn_keypoint = QPushButton("📍 关键点")
+        self.btn_keypoint.setCheckable(True)
+        self.btn_keypoint.clicked.connect(lambda: self.set_tool('keypoint'))
+        toolbar.addWidget(self.btn_keypoint)
+        self.btn_keypoint.hide()  # 默认隐藏
+        self.tool_group.addButton(self.btn_keypoint)
+        
+        # # OBB工具
+        # self.btn_obb = QPushButton("🔲 旋转矩形 (O)")
+        # self.btn_obb.setCheckable(True)
+        # self.btn_obb.clicked.connect(lambda: self.set_tool('obb'))
+        # toolbar.addWidget(self.btn_obb)
+        # self.btn_obb.hide()  # 默认隐藏
+        # self.tool_group.addButton(self.btn_obb)
+        
         # 移动工具
-        self.btn_move = QPushButton("✋ 移动 (V)")
+        self.btn_move = QPushButton("✋ 移动")
         self.btn_move.setCheckable(True)
         self.btn_move.clicked.connect(lambda: self.set_tool('move'))
         toolbar.addWidget(self.btn_move)
@@ -2160,6 +2603,39 @@ Esc - 取消操作
             # 重新加载当前图片的标注
             if self.current_image_id:
                 self.load_annotations()
+        
+        # 根据任务类型调整标注工具显示
+        self.adjust_tool_visibility(task_type)
+    
+    def adjust_tool_visibility(self, task_type):
+        """根据任务类型调整标注工具的显示"""
+        # 隐藏所有标注工具
+        self.btn_rectangle.hide()
+        self.btn_polygon.hide()
+        self.btn_keypoint.hide()
+        
+        # 根据任务类型显示对应的工具
+        if task_type == 'detect':
+            self.btn_rectangle.show()
+            # 默认选中矩形工具
+            self.btn_rectangle.setChecked(True)
+            self.set_tool('rectangle')
+        elif task_type == 'segment':
+            self.btn_polygon.show()
+            # 默认选中多边形工具
+            self.btn_polygon.setChecked(True)
+            self.set_tool('polygon')
+        elif task_type == 'pose':
+            self.btn_keypoint.show()
+            # 默认选中关键点工具
+            self.btn_keypoint.setChecked(True)
+            self.set_tool('keypoint')
+        elif task_type == 'classify':
+            # 分类任务不需要标注工具
+            pass
+        
+        # 移动工具始终显示
+        self.btn_move.show()
     
     def load_image(self, image_id: int):
         """加载图片"""
@@ -2205,12 +2681,16 @@ Esc - 取消操作
         """设置工具"""
         self.canvas.set_tool(tool)
         
-        tool_names = {
-            'rectangle': '矩形',
-            'polygon': '多边形',
-            'move': '移动'
-        }
-        self.status_tool.setText(f"工具: {tool_names.get(tool, tool)}")
+        # 确保status_tool存在时才更新
+        if hasattr(self, 'status_tool'):
+            tool_names = {
+                'rectangle': '矩形',
+                'polygon': '多边形',
+                'move': '移动',
+                'keypoint': '关键点',
+                'obb': '旋转矩形'
+            }
+            self.status_tool.setText(f"工具: {tool_names.get(tool, tool)}")
     
     def on_annotation_created(self, annotation: dict):
         """标注创建事件"""

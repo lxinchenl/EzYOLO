@@ -38,7 +38,7 @@ ULTRALYTICS_MODELS = {
     },
     "YOLOv8": {
         "sizes": ["n", "s", "m", "l", "x"],
-        "tasks": ["detect", "classify", "obb", "pose", "segment", "world"],
+        "tasks": ["detect", "classify", "pose", "segment", "world"],
         "prefix": "yolov8",
     },
     "YOLOv9": {
@@ -53,7 +53,7 @@ ULTRALYTICS_MODELS = {
     },
     "YOLOv11": {
         "sizes": ["n", "s", "m", "l", "x"],
-        "tasks": ["detect", "classify", "obb", "pose", "segment"],
+        "tasks": ["detect", "classify", "pose", "segment"],
         "prefix": "yolo11",
     },
     "YOLOv12": {
@@ -63,7 +63,7 @@ ULTRALYTICS_MODELS = {
     },
     "YOLOv26": {
         "sizes": ["n", "s", "m", "l", "x"],
-        "tasks": ["detect", "classify", "obb", "pose", "segment"],
+        "tasks": ["detect", "classify", "pose", "segment"],
         "prefix": "yolo26",
     },
 }
@@ -74,7 +74,6 @@ TASK_NAMES = {
     "segment": "实例分割",
     "classify": "图像分类",
     "pose": "姿态估计",
-    "obb": "旋转框检测",
     "world": "开放词汇检测",
 }
 
@@ -154,7 +153,6 @@ class TrainingThread(QThread):
             "segment": "seg",
             "classify": "cls",
             "pose": "pose",
-            "obb": "obb",
             "world": "world"
         }
         
@@ -355,9 +353,17 @@ class TrainingThread(QThread):
             
             # 创建数据集目录（使用基于应用根目录的相对路径）
             import os
+            import shutil
             from pathlib import Path
             app_root = Path(__file__).parent.parent.parent  # 向上三级到EzYOLO根目录
             dataset_dir = app_root / f"datasets/project_{self.project_id}"
+            
+            # 清空原有训练数据目录
+            if os.path.exists(dataset_dir):
+                self.log_message.emit(f"清空原有训练数据目录: {dataset_dir}")
+                shutil.rmtree(dataset_dir)
+            
+            # 重新创建目录结构
             os.makedirs(dataset_dir, exist_ok=True)
             
             # 创建images和labels目录
@@ -492,19 +498,31 @@ class TrainingThread(QThread):
                                         f.write(line)
                                     elif ann_type == 'obb':
                                         # 旋转框标注（用于obb任务）
-                                        x = data.get('x', 0)
-                                        y = data.get('y', 0)
-                                        w = data.get('width', 0)
-                                        h = data.get('height', 0)
-                                        angle = data.get('angle', 0)
-                                        
-                                        x_center = (x + w / 2) / img_w
-                                        y_center = (y + h / 2) / img_h
-                                        width = w / img_w
-                                        height = h / img_h
-                                        
-                                        line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} {angle:.6f}\n"
-                                        f.write(line)
+                                        # 检查是否有八个角点的坐标
+                                        if 'points' in data and len(data['points']) == 4:
+                                            # 直接使用八个角点格式（x1 y1 x2 y2 x3 y3 x4 y4）
+                                            line = f"{class_id} "
+                                            for point in data['points']:
+                                                px = point.get('x', 0) / img_w
+                                                py = point.get('y', 0) / img_h
+                                                line += f"{px:.6f} {py:.6f} "
+                                            line += "\n"
+                                            f.write(line)
+                                        else:
+                                            # 如果没有八个角点坐标，使用默认的xywhr格式
+                                            x = data.get('x', 0)
+                                            y = data.get('y', 0)
+                                            w = data.get('width', 0)
+                                            h = data.get('height', 0)
+                                            angle = data.get('angle', 0)
+                                            
+                                            x_center = (x + w / 2) / img_w
+                                            y_center = (y + h / 2) / img_h
+                                            width = w / img_w
+                                            height = h / img_h
+                                            
+                                            line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} {angle:.6f}\n"
+                                            f.write(line)
                         except Exception:
                             pass
             

@@ -281,6 +281,13 @@ class Database:
                     (project_id,)
                 )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_all_images(self) -> List[Dict]:
+        """获取所有图像记录"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM images ORDER BY created_at")
+            return [dict(row) for row in cursor.fetchall()]
     
     def get_image(self, image_id: int) -> Optional[Dict]:
         """获取单个图像信息"""
@@ -318,6 +325,24 @@ class Database:
     
     def delete_image(self, image_id: int) -> bool:
         """删除图像"""
+        import os
+        
+        # 先获取图像的存储路径
+        storage_path = None
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT storage_path FROM images WHERE id = ?", (image_id,))
+            row = cursor.fetchone()
+            if row:
+                storage_path = row['storage_path']
+        
+        # 删除实际文件（如果存在）
+        if storage_path and os.path.exists(storage_path):
+            try:
+                os.remove(storage_path)
+            except Exception:
+                pass  # 文件删除失败不影响数据库操作
+        
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
@@ -476,8 +501,8 @@ class Database:
             )
             return cursor.rowcount > 0
     
-    def get_project_training_jobs(self, project_id: int) -> List[Dict]:
-        """获取项目的所有训练任务"""
+    def get_training_jobs(self, project_id: int) -> List[Dict]:
+        """获取项目的训练任务"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -492,6 +517,85 @@ class Database:
                 job['metrics'] = json.loads(job['metrics'])
                 jobs.append(job)
             return jobs
+
+    def sync_files_with_database(self) -> Dict:
+        """同步数据库与真实文件
+        
+        清理数据库中不存在的真实文件，确保数据库记录与实际文件一致
+        
+        Returns:
+            Dict: 同步结果，包含删除的文件数量等信息
+        """
+        import os
+        
+        deleted_db_count = 0
+        deleted_file_count = 0
+        deleted_db_files = []
+        deleted_actual_files = []
+        
+        # 获取所有图像记录
+        images = self.get_all_images()
+        
+        # 构建数据库中存在的文件路径集合
+        db_files = set()
+        for image in images:
+            storage_path = image.get('storage_path')
+            if storage_path:
+                db_files.add(storage_path)
+        
+        # 第一部分：清理数据库中不存在的文件记录
+        for image in images:
+            storage_path = image.get('storage_path')
+            if storage_path:
+                # 检查文件是否存在
+                if not os.path.exists(storage_path):
+                    # 文件不存在，删除数据库记录
+                    image_id = image.get('id')
+                    if image_id:
+                        try:
+                            # 删除相关标注
+                            self.delete_image_annotations(image_id)
+                            # 删除图像记录
+                            with self.get_connection() as conn:
+                                cursor = conn.cursor()
+                                cursor.execute("DELETE FROM images WHERE id = ?", (image_id,))
+                            deleted_db_count += 1
+                            deleted_db_files.append(storage_path)
+                        except Exception:
+                            pass  # 忽略删除失败的情况
+        
+        # 第二部分：清理文件夹中不存在于数据库的文件
+        # 获取所有项目目录
+        import glob
+        from pathlib import Path
+        
+        # 查找所有projects目录下的文件夹
+        projects_dir = Path(__file__).parent.parent / "projects"
+        if projects_dir.exists():
+            # 遍历所有项目文件夹
+            for project_folder in projects_dir.iterdir():
+                if project_folder.is_dir():
+                    # 遍历项目文件夹中的所有文件
+                    for root, dirs, files in os.walk(project_folder):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            # 检查文件是否在数据库中存在
+                            if file_path not in db_files:
+                                # 文件不在数据库中，删除实际文件
+                                try:
+                                    os.remove(file_path)
+                                    deleted_file_count += 1
+                                    deleted_actual_files.append(file_path)
+                                except Exception:
+                                    pass  # 忽略删除失败的情况
+        
+        return {
+            'deleted_db_count': deleted_db_count,
+            'deleted_file_count': deleted_file_count,
+            'deleted_db_files': deleted_db_files,
+            'deleted_actual_files': deleted_actual_files,
+            'total_deleted': deleted_db_count + deleted_file_count
+        }
 
 
 # 全局数据库实例

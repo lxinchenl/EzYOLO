@@ -17,6 +17,7 @@ from gui.pages.train_page import TrainPage
 from gui.pages.result_page import ResultPage
 from gui.pages.settings_page import SettingsPage
 from gui.pages.about_page import AboutPage
+from models.database import db
 
 
 class MainWindow(QMainWindow):
@@ -68,6 +69,9 @@ class MainWindow(QMainWindow):
         
         # 连接主题变化信号
         self.settings_page.theme_changed.connect(self.on_theme_changed)
+        
+        # 启动时同步数据库与真实文件
+        self.sync_database_files()
         
         # 设置布局比例
         main_layout.setStretch(0, 0)  # 侧边栏固定宽度
@@ -268,3 +272,24 @@ class MainWindow(QMainWindow):
         """关闭事件"""
         self.save_window_state()
         event.accept()
+
+    def sync_database_files(self):
+        """同步数据库与真实文件"""
+        try:
+            # 调用数据库同步方法
+            result = db.sync_files_with_database()
+            
+            deleted_db_count = result.get('deleted_db_count', 0)
+            deleted_file_count = result.get('deleted_file_count', 0)
+            total_deleted = result.get('total_deleted', 0)
+            
+            if total_deleted > 0:
+                print(f"[同步] 删除了 {deleted_db_count} 个数据库中不存在的文件记录")
+                print(f"[同步] 删除了 {deleted_file_count} 个文件夹中不存在于数据库的文件")
+                print(f"[同步] 总共删除了 {total_deleted} 个项目")
+                # 可以在这里添加一个通知，告知用户同步结果
+                # 例如：QMessageBox.information(self, "同步完成", f"删除了 {deleted_file_count} 个不存在于数据库的文件和 {deleted_db_count} 个无效记录")
+            else:
+                print("[同步] 数据库与文件系统一致，无需删除")
+        except Exception as e:
+            print(f"[同步] 同步过程中出现错误: {str(e)}")
