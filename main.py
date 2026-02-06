@@ -9,14 +9,29 @@ import sys
 import os
 from pathlib import Path
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, qInstallMessageHandler, QtMsgType
 from PyQt6.QtGui import QIcon
 
 from gui.main_window import MainWindow
 
 
+def qt_message_handler(msg_type, context, message):
+    """自定义Qt消息处理器，过滤QFont警告"""
+    # 过滤掉QFont::setPointSize的警告
+    msg_str = str(message).strip()
+    if "QFont::setPointSize" in msg_str and "Point size <= 0" in msg_str:
+        return  # 忽略这个警告
+    
+    # 其他消息正常输出到stderr（Qt的默认行为）
+    if msg_type >= QtMsgType.QtWarningMsg:
+        print(msg_str, file=sys.stderr)
+
+
 def main():
     """主函数"""
+    # 安装自定义消息处理器，屏蔽QFont警告
+    qInstallMessageHandler(qt_message_handler)
+    
     # 启用高DPI支持
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough

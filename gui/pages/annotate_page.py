@@ -123,6 +123,9 @@ class AnnotationCanvas(QFrame):
         self.editing = False
         self.dragging = False
         self.resizing = False
+        # 多边形顶点拖动（move工具下）
+        self.dragging_vertex = False
+        self.drag_vertex_index = None
         self.drag_start = None
         self.drag_start_annotation = None
         self.resize_handle = None
@@ -135,6 +138,12 @@ class AnnotationCanvas(QFrame):
         
         # 手柄大小
         self.handle_size = 8
+        # 多边形顶点命中阈值（控件坐标，像素）
+        self.vertex_hit_radius = 8
+        # 多边形顶点“磁吸/辅助命中”半径（比命中半径略大一点）
+        self.vertex_snap_radius = 14
+        # 当前悬停的多边形顶点 (annotation_id, vertex_index) / None
+        self.hover_vertex = None
         
         # 类别颜色（动态获取）
         self.class_colors = {}
@@ -775,18 +784,36 @@ class AnnotationCanvas(QFrame):
                     clicked_annotation = self.get_annotation_at(event.pos())
                     if clicked_annotation:
                         self.selected_annotation_id = clicked_annotation['id']
+                        ann_type = clicked_annotation.get('type', 'bbox')
+                        ann_data = clicked_annotation.get('data', {})
+
+                        # 点到多边形顶点：拖动该点，而不是拖动整个多边形
+                        if ann_type == 'polygon':
+                            # 先用更宽松的“最近点磁吸”选择顶点，提升易用性
+                            vertex_idx = self.get_nearest_polygon_vertex_at(event.pos(), clicked_annotation, self.vertex_snap_radius)
+                            if vertex_idx is None:
+                                vertex_idx = self.get_polygon_vertex_at(event.pos(), clicked_annotation)
+                            if vertex_idx is not None:
+                                self.dragging_vertex = True
+                                self.drag_vertex_index = vertex_idx
+                                self.drag_start = event.pos()
+                                self.drag_start_annotation = None
+                                self.annotation_selected.emit(self.selected_annotation_id)
+                                self.update()
+                                return
+
+                        # 否则：拖动整个标注
                         self.dragging = True
                         self.drag_start = event.pos()
                         # 深度复制标注数据，特别是多边形的点
-                        ann_type = clicked_annotation.get('type', 'bbox')
-                        ann_data = clicked_annotation['data']
                         if ann_type == 'polygon' and 'points' in ann_data:
                             # 对多边形点进行深度复制
-                            self.drag_start_annotation = {'points': []}
-                            for point in ann_data['points']:
-                                self.drag_start_annotation['points'].append(point.copy())
+                            self.drag_start_annotation = {'points': [p.copy() for p in ann_data.get('points', [])]}
+                        elif ann_type == 'keypoint' and 'keypoints' in ann_data:
+                            # 对关键点进行深度复制
+                            self.drag_start_annotation = {'keypoints': [kp.copy() for kp in ann_data.get('keypoints', [])]}
                         else:
-                            self.drag_start_annotation = ann_data.copy()
+                            self.drag_start_annotation = ann_data.copy() if isinstance(ann_data, dict) else {}
                         self.annotation_selected.emit(self.selected_annotation_id)
                     else:
                         # 没有点击标注，开始平移图片
@@ -820,6 +847,22 @@ class AnnotationCanvas(QFrame):
                 # 调整大小
                 self.resize_annotation(event.pos())
                 self.update()
+            elif self.dragging_vertex and self.selected_annotation_id is not None:
+                # 拖动多边形的某个顶点
+                annotation = next((ann for ann in self.annotations if ann['id'] == self.selected_annotation_id), None)
+                if annotation and annotation.get('type') == 'polygon':
+                    points = annotation.get('data', {}).get('points', [])
+                    idx = self.drag_vertex_index
+                    if idx is not None and 0 <= idx < len(points):
+                        img_x, img_y = self.widget_to_image(event.pos().x(), event.pos().y())
+                        if self.current_image:
+                            img_w = self.current_image.width()
+                            img_h = self.current_image.height()
+                            img_x = max(0, min(img_x, img_w))
+                            img_y = max(0, min(img_y, img_h))
+                        points[idx]['x'] = img_x
+                        points[idx]['y'] = img_y
+                self.update()
             elif self.dragging and self.drag_start and self.drag_start_annotation:
                 # 拖动标注
                 self.drag_annotation(event.pos())
@@ -840,8 +883,20 @@ class AnnotationCanvas(QFrame):
                 else:
                     annotation = self.get_annotation_at(event.pos())
                     if annotation:
+                        # 轻微磁吸：靠近多边形顶点时，更容易“抓住点”
+                        if annotation.get('type') == 'polygon':
+                            vidx = self.get_nearest_polygon_vertex_at(event.pos(), annotation, self.vertex_snap_radius)
+                            if vidx is not None:
+                                self.hover_vertex = (annotation.get('id'), vidx)
+                                self.setCursor(Qt.CursorShape.PointingHandCursor)
+                            else:
+                                self.hover_vertex = None
+                                self.setCursor(Qt.CursorShape.OpenHandCursor)
+                        else:
+                            self.hover_vertex = None
                         self.setCursor(Qt.CursorShape.OpenHandCursor)
                     else:
+                        self.hover_vertex = None
                         # 图片放大时可以平移
                         if self.image_scale > 1.0:
                             self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -871,6 +926,15 @@ class AnnotationCanvas(QFrame):
                 self.resizing = False
                 self.resize_handle = None
                 self.resize_start_rect = None
+                # 发送修改信号
+                if self.selected_annotation_id is not None:
+                    annotation = next((ann for ann in self.annotations if ann['id'] == self.selected_annotation_id), None)
+                    if annotation:
+                        self.annotation_modified.emit(self.selected_annotation_id, annotation['data'])
+            elif self.dragging_vertex:
+                self.dragging_vertex = False
+                self.drag_vertex_index = None
+                self.drag_start = None
                 # 发送修改信号
                 if self.selected_annotation_id is not None:
                     annotation = next((ann for ann in self.annotations if ann['id'] == self.selected_annotation_id), None)
@@ -908,6 +972,47 @@ class AnnotationCanvas(QFrame):
             if self.is_point_in_annotation(pos, annotation):
                 return annotation
         return None
+
+    def get_polygon_vertex_at(self, pos: QPoint, annotation: Dict) -> Optional[int]:
+        """如果pos命中多边形顶点，返回顶点索引，否则None（控件坐标判定）"""
+        if not annotation or annotation.get('type') != 'polygon':
+            return None
+        data = annotation.get('data', {})
+        points = data.get('points', [])
+        if not points:
+            return None
+
+        for idx, pt in enumerate(points):
+            if not isinstance(pt, dict) or 'x' not in pt or 'y' not in pt:
+                continue
+            wp = self.image_to_widget(pt['x'], pt['y'])
+            if (pos - wp).manhattanLength() <= self.vertex_hit_radius:
+                return idx
+        return None
+
+    def get_nearest_polygon_vertex_at(self, pos: QPoint, annotation: Dict, radius: int) -> Optional[int]:
+        """返回radius范围内最近的多边形顶点索引（控件坐标），否则None。
+
+        用于提供轻微“磁吸/辅助命中”，让用户更容易选中顶点。
+        """
+        if not annotation or annotation.get('type') != 'polygon':
+            return None
+        data = annotation.get('data', {})
+        points = data.get('points', [])
+        if not points:
+            return None
+
+        best_idx = None
+        best_dist = None
+        for idx, pt in enumerate(points):
+            if not isinstance(pt, dict) or 'x' not in pt or 'y' not in pt:
+                continue
+            wp = self.image_to_widget(pt['x'], pt['y'])
+            d = (pos - wp).manhattanLength()
+            if d <= radius and (best_dist is None or d < best_dist):
+                best_dist = d
+                best_idx = idx
+        return best_idx
     
     def get_resize_handle_at(self, pos: QPoint) -> Optional[Dict]:
         """获取指定位置的调整手柄信息"""
@@ -1205,6 +1310,19 @@ class AnnotationCanvas(QFrame):
             
             # 使用射线法检测点是否在OBB内
             return self.point_in_polygon(pos.x(), pos.y(), widget_points)
+        elif ann_type == 'keypoint':
+            # 检查是否点击了任何一个关键点
+            keypoints = data.get('keypoints', [])
+            for kp in keypoints:
+                kp_x = kp.get('x', 0)
+                kp_y = kp.get('y', 0)
+                # 转换为控件坐标
+                widget_kp = self.image_to_widget(kp_x, kp_y)
+                # 计算鼠标位置与关键点的距离
+                distance = math.sqrt((pos.x() - widget_kp.x()) ** 2 + (pos.y() - widget_kp.y()) ** 2)
+                # 设置阈值，10像素范围内视为点击了关键点
+                if distance <= 10:
+                    return True
         
         return False
     
@@ -2121,15 +2239,26 @@ Esc - 取消操作
         
         # 显示对话框
         if self.auto_label_dialog.exec() == QDialog.DialogCode.Accepted:
+            # 获取任务类型
+            model_task = self.auto_label_dialog.get_model_task()
+            
             # 保存设置
             self.auto_label_settings = {
                 'model_path': self.auto_label_dialog.get_model_path(),
+                'model_task': model_task,  # 保存任务类型
                 'conf_threshold': self.auto_label_dialog.sb_conf_threshold.value(),
                 'iou_threshold': self.auto_label_dialog.sb_iou_threshold.value(),
                 'class_mapping': self.auto_label_dialog.get_class_mappings(),
                 'only_unlabeled': self.auto_label_dialog.chk_only_unlabeled.isChecked(),
                 'overwrite_labels': self.auto_label_dialog.chk_overwrite.isChecked()
             }
+            
+            # 输出调试信息
+            print("=" * 50)
+            print("标注页面保存自动标注设置:")
+            print(f"  模型路径: {self.auto_label_settings['model_path']}")
+            print(f"  任务类型: {self.auto_label_settings['model_task']}")
+            print("=" * 50)
             
             # 更新标注页面的类别列表
             if hasattr(self.auto_label_dialog, 'project_classes'):
@@ -2308,6 +2437,7 @@ Esc - 取消操作
             if hasattr(self, 'auto_label_settings'):
                 settings = self.auto_label_settings
                 model_path = settings.get('model_path', "yolov8n")
+                model_task = settings.get('model_task', 'detect')  # 获取保存的任务类型
                 conf_threshold = settings.get('conf_threshold', 0.5)
                 iou_threshold = settings.get('iou_threshold', 0.45)
                 class_mapping = settings.get('class_mapping', {})
@@ -2315,17 +2445,54 @@ Esc - 取消操作
             else:
                 # 默认模型参数
                 model_path = "yolov8n"
+                model_task = 'detect'
                 conf_threshold = 0.5
                 iou_threshold = 0.45
                 class_mapping = {}
                 overwrite_labels = False
             
+            # 使用process_single_image方法，支持model_task
             labeler = AutoLabeler(model_path, self.model_manager)
-            annotations = labeler.process_image(
+            
+            # 加载模型配置
+            import re
+            match = re.match(r'(yolov)(\d+)([a-z])', model_path)
+            if match:
+                version_num = match.group(2)
+                size = match.group(3)
+                version = f"YOLOv{version_num}"
+                load_config = {
+                    'model_version': version,
+                    'model_size': size,
+                    'model_source': 'official',
+                    'model_task': model_task,  # 使用保存的任务类型
+                    'class_mappings': class_mapping
+                }
+                labeler.load_model(load_config)
+            else:
+                # 自定义模型
+                if os.path.exists(model_path):
+                    # 对于自定义模型，也需要设置model_task
+                    load_config = {
+                        'model_version': '',  # 自定义模型不需要版本
+                        'model_size': '',  # 自定义模型不需要大小
+                        'model_source': 'custom',
+                        'model_task': model_task,  # 使用保存的任务类型
+                        'custom_model_path': model_path,
+                        'class_mappings': class_mapping
+                    }
+                    labeler.load_model(load_config)
+            
+            # 处理图像
+            config = {
+                'conf_threshold': conf_threshold,
+                'iou_threshold': iou_threshold,
+                'class_mappings': class_mapping
+            }
+            annotations = labeler.process_single_image(
                 self.current_image_data['storage_path'], 
-                conf_threshold, 
-                iou_threshold, 
-                class_mapping
+                self.current_image_id,
+                config
             )
             
             # 更新当前图像的标注
@@ -2399,6 +2566,7 @@ Esc - 取消操作
             if hasattr(self, 'auto_label_settings'):
                 settings = self.auto_label_settings
                 model_path = settings.get('model_path', "yolov8n")
+                model_task = settings.get('model_task', 'detect')  # 获取保存的任务类型
                 conf_threshold = settings.get('conf_threshold', 0.5)
                 iou_threshold = settings.get('iou_threshold', 0.45)
                 class_mapping = settings.get('class_mapping', {})
@@ -2406,6 +2574,7 @@ Esc - 取消操作
             else:
                 # 默认模型参数
                 model_path = "yolov8n"
+                model_task = 'detect'
                 conf_threshold = 0.5
                 iou_threshold = 0.45
                 class_mapping = {}
@@ -2422,9 +2591,9 @@ Esc - 取消操作
                 QMessageBox.warning(self, "提示", f"没有符合条件的图片\n总图片数: {len(self.images)}\n未标注图片数: {len([img for img in self.images if img.get('status') not in ['annotated', 'completed']])}")
                 return
             
-            # 开始批量处理
+            # 开始批量处理，传递model_task
             self.batch_labeling_manager.start_batch_processing(
-                model_path, filtered_images, conf_threshold, iou_threshold, class_mapping, self.model_manager
+                model_path, filtered_images, conf_threshold, iou_threshold, class_mapping, self.model_manager, model_task
             )
             
             # 批量处理是异步的，通过信号处理完成事件
@@ -2434,13 +2603,40 @@ Esc - 取消操作
             # 隐藏加载动画
             self.hide_loading_animation()
     
-    def on_single_inference_requested(self, model_path, conf_threshold, iou_threshold, class_mapping, image_path):
+    def on_single_inference_requested(self, model_path, conf_threshold, iou_threshold, class_mapping, image_path, model_task='detect'):
         """单张推理请求回调"""
         from core.auto_labeler import AutoLabeler
         
         try:
             labeler = AutoLabeler(model_path, self.model_manager)
-            annotations = labeler.process_image(image_path, conf_threshold, iou_threshold, class_mapping)
+            
+            # 加载模型，指定任务类型
+            import re
+            match = re.match(r'(yolov)(\d+)([a-z])', model_path)
+            if match:
+                version_num = match.group(2)
+                size = match.group(3)
+                version = f"YOLOv{version_num}"
+                load_config = {
+                    'model_version': version,
+                    'model_size': size,
+                    'model_source': 'official',
+                    'model_task': model_task,
+                    'class_mappings': class_mapping
+                }
+                labeler.load_model(load_config)
+            else:
+                # 自定义模型
+                if os.path.exists(model_path):
+                    labeler.current_model = self.model_manager.load_custom_model(model_path)
+            
+            # 处理图像
+            config = {
+                'conf_threshold': conf_threshold,
+                'iou_threshold': iou_threshold,
+                'class_mappings': class_mapping
+            }
+            annotations = labeler.process_single_image(image_path, self.current_image_id, config)
             
             # 获取覆盖标签设置
             overwrite_labels = False
@@ -2500,7 +2696,7 @@ Esc - 取消操作
         except Exception as e:
             QMessageBox.critical(self, "错误", f"自动标注失败: {str(e)}")
     
-    def on_batch_inference_requested(self, model_path, conf_threshold, iou_threshold, class_mapping, images, only_unlabeled):
+    def on_batch_inference_requested(self, model_path, conf_threshold, iou_threshold, class_mapping, images, only_unlabeled, model_task='detect'):
         """批量推理请求回调"""
         # 过滤图像（如果只处理未标注的）
         if only_unlabeled:
@@ -2514,7 +2710,7 @@ Esc - 取消操作
         
         # 开始批量处理
         self.batch_labeling_manager.start_batch_processing(
-            model_path, filtered_images, conf_threshold, iou_threshold, class_mapping, self.model_manager
+            model_path, filtered_images, conf_threshold, iou_threshold, class_mapping, self.model_manager, model_task
         )
     
     def on_batch_inference_progress(self, progress, current, total, image_name):
@@ -3197,18 +3393,38 @@ Esc - 取消操作
                                     y = data.get('y', 0)
                                     width = data.get('width', 0)
                                     height = data.get('height', 0)
-                                    
+
                                     # 计算中心点和归一化
                                     img_width = image.get('width', 1920)  # 默认宽度
                                     img_height = image.get('height', 1080)  # 默认高度
-                                    
+
                                     x_center = (x + width/2) / img_width
                                     y_center = (y + height/2) / img_height
                                     norm_width = width / img_width
                                     norm_height = height / img_height
-                                    
+
                                     # 写入文件
                                     f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {norm_width:.6f} {norm_height:.6f}\n")
+                                elif ann_type == 'mask':
+                                    # YOLO分割格式：class_id x1 y1 x2 y2 ... xn yn
+                                    mask = data.get('mask', [])
+                                    if mask:
+                                        # 计算归一化
+                                        img_width = image.get('width', 1920)  # 默认宽度
+                                        img_height = image.get('height', 1080)  # 默认高度
+
+                                        # 构建归一化的多边形坐标
+                                        normalized_points = []
+                                        for point in mask:
+                                            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                                                x, y = point[0], point[1]
+                                                norm_x = x / img_width
+                                                norm_y = y / img_height
+                                                normalized_points.extend([f"{norm_x:.6f}", f"{norm_y:.6f}"])
+
+                                        if normalized_points:
+                                            # 写入文件
+                                            f.write(f"{class_id} {' '.join(normalized_points)}\n")
                         
                         exported_count += 1
                 

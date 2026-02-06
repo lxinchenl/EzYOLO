@@ -98,11 +98,11 @@ class AboutPage(QWidget):
         
         layout = QFormLayout(group)
         
-        version_label = QLabel("1.0.0")
+        version_label = QLabel("1.1.0")
         version_label.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
         layout.addRow("版本:", version_label)
         
-        update_label = QLabel("2026-01-29")
+        update_label = QLabel("2026-02-06")
         update_label.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
         layout.addRow("更新日期:", update_label)
         

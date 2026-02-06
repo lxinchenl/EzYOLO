@@ -86,8 +86,8 @@ class AutoLabelDialog(QDialog):
     """自动打标签弹窗"""
     
     # 信号定义
-    single_inference_requested = pyqtSignal(str, float, float, dict, str)  # 单张推理请求
-    batch_inference_requested = pyqtSignal(str, float, float, dict, list, bool)  # 批量推理请求
+    single_inference_requested = pyqtSignal(str, float, float, dict, str, str)  # 单张推理请求
+    batch_inference_requested = pyqtSignal(str, float, float, dict, list, bool, str)  # 批量推理请求
     
     def __init__(self, parent=None, project_classes=None):
         super().__init__(parent)
@@ -138,7 +138,7 @@ class AutoLabelDialog(QDialog):
         
         # 保存按钮
         self.btn_save = QPushButton("保存")
-        self.btn_save.clicked.connect(self.accept)
+        self.btn_save.clicked.connect(self.on_save_clicked)
         button_layout.addWidget(self.btn_save)
         
         # 取消按钮
@@ -155,8 +155,8 @@ class AutoLabelDialog(QDialog):
         
         layout = QVBoxLayout(group)
         
-        # 模型版本和型号
-        version_size_layout = QHBoxLayout()
+        # 模型版本、型号和任务
+        version_size_task_layout = QHBoxLayout()
         
         # 模型版本
         version_layout = QFormLayout()
@@ -164,15 +164,21 @@ class AutoLabelDialog(QDialog):
         self.cb_model_version.addItems(sorted(ULTRALYTICS_MODELS.keys()))
         self.cb_model_version.currentTextChanged.connect(self.on_model_version_changed)
         version_layout.addRow("模型版本:", self.cb_model_version)
-        version_size_layout.addLayout(version_layout)
+        version_size_task_layout.addLayout(version_layout)
         
         # 模型型号
         size_layout = QFormLayout()
         self.cb_model_size = QComboBox()
         size_layout.addRow("型号:", self.cb_model_size)
-        version_size_layout.addLayout(size_layout)
+        version_size_task_layout.addLayout(size_layout)
         
-        layout.addLayout(version_size_layout)
+        # 任务类型
+        task_layout = QFormLayout()
+        self.cb_model_task = QComboBox()
+        task_layout.addRow("任务类型:", self.cb_model_task)
+        version_size_task_layout.addLayout(task_layout)
+        
+        layout.addLayout(version_size_task_layout)
         
         # 模型来源
         source_group = QGroupBox("模型来源")
@@ -353,13 +359,25 @@ class AutoLabelDialog(QDialog):
         """
     
     def on_model_version_changed(self, version: str):
-        """模型版本改变时更新型号列表"""
+        """模型版本改变时更新型号和任务类型列表"""
         self.cb_model_size.clear()
+        self.cb_model_task.clear()
+        
         if version in ULTRALYTICS_MODELS:
+            # 更新型号列表
             sizes = ULTRALYTICS_MODELS[version]['sizes']
             for size in sizes:
                 display_name = SIZE_NAMES.get(size, size)
                 self.cb_model_size.addItem(display_name, size)
+            
+            # 更新任务类型列表
+            tasks = ULTRALYTICS_MODELS[version]['tasks']
+            for task in tasks:
+                self.cb_model_task.addItem(task)
+            
+            # 默认选择第一个任务类型
+            if tasks:
+                self.cb_model_task.setCurrentIndex(0)
     
     def on_model_source_changed(self):
         """模型来源改变时更新界面"""
@@ -416,13 +434,17 @@ class AutoLabelDialog(QDialog):
             QMessageBox.warning(self, "错误", "请选择有效的模型")
             return
         
+        # 获取任务类型
+        model_task = self.cb_model_task.currentText() if hasattr(self, 'cb_model_task') else 'detect'
+        
         # 发送信号
         self.single_inference_requested.emit(
             model_path,
             self.sb_conf_threshold.value(),
             self.sb_iou_threshold.value(),
             self.class_mappings,
-            getattr(self, 'current_image_path', '')
+            getattr(self, 'current_image_path', ''),
+            model_task
         )
         # 关闭弹窗
         self.accept()
@@ -435,6 +457,9 @@ class AutoLabelDialog(QDialog):
             QMessageBox.warning(self, "错误", "请选择有效的模型")
             return
         
+        # 获取任务类型
+        model_task = self.cb_model_task.currentText() if hasattr(self, 'cb_model_task') else 'detect'
+        
         # 发送信号
         self.batch_inference_requested.emit(
             model_path,
@@ -442,7 +467,8 @@ class AutoLabelDialog(QDialog):
             self.sb_iou_threshold.value(),
             self.class_mappings,
             getattr(self, 'current_images', []),
-            self.chk_only_unlabeled.isChecked()
+            self.chk_only_unlabeled.isChecked(),
+            model_task
         )
         # 关闭弹窗
         self.accept()
@@ -557,6 +583,38 @@ class AutoLabelDialog(QDialog):
         # 这里可以实现一个更复杂的映射编辑界面
         # 暂时使用简单的消息框
         QMessageBox.information(self, "编辑映射", "类别映射编辑功能开发中...")
+    
+    def on_save_clicked(self):
+        """保存按钮点击事件，输出调试信息"""
+        # 获取模型信息
+        model_path = self.get_model_path()
+        model_task = self.cb_model_task.currentText() if hasattr(self, 'cb_model_task') else 'detect'
+        model_version = self.cb_model_version.currentText() if hasattr(self, 'cb_model_version') else ''
+        model_size = self.cb_model_size.currentData() or self.cb_model_size.currentText() if hasattr(self, 'cb_model_size') else ''
+        
+        # 构建模型名称
+        if self.model_source == "custom":
+            model_name = os.path.basename(model_path) if model_path else "自定义模型"
+        else:
+            model_name = f"{model_version}-{model_size}-{model_task}" if model_version else model_path
+        
+        # 输出调试信息
+        print("=" * 50)
+        print("自动标注设置保存:")
+        print(f"  当前任务类型: {model_task}")
+        print(f"  模型名称: {model_name}")
+        print(f"  模型路径: {model_path}")
+        print(f"  模型版本: {model_version}")
+        print(f"  模型大小: {model_size}")
+        print(f"  模型来源: {self.model_source}")
+        print("=" * 50)
+        
+        # 调用accept保存设置
+        self.accept()
+    
+    def get_model_task(self) -> str:
+        """获取当前选择的任务类型"""
+        return self.cb_model_task.currentText() if hasattr(self, 'cb_model_task') else 'detect'
     
     def get_class_mappings(self):
         """获取类别映射"""

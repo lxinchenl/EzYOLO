@@ -24,6 +24,7 @@ class AutoLabeler:
         self.current_model = None
         self.model_info = {}
         self.class_mappings = {}
+        self.model_task = 'detect'
     
     def load_model(self, config: Dict) -> bool:
         """加载模型
@@ -38,12 +39,24 @@ class AutoLabeler:
             model_version = config['model_version']
             model_size = config['model_size']
             model_source = config['model_source']
+            model_task = config.get('model_task', 'detect')
             custom_model_path = config.get('custom_model_path', '')
+            
+            # 输出调试信息
+            print("=" * 50)
+            print("AutoLabeler.load_model 开始加载模型:")
+            print(f"  模型版本: {model_version}")
+            print(f"  模型大小: {model_size}")
+            print(f"  模型来源: {model_source}")
+            print(f"  任务类型: {model_task}")
+            if model_source == 'custom':
+                print(f"  自定义模型路径: {custom_model_path}")
+            print("=" * 50)
             
             # 加载模型
             if model_source == 'official':
                 self.current_model = model_manager.load_model(
-                    model_version, model_size, 'detect'
+                    model_version, model_size, model_task
                 )
             else:
                 self.current_model = model_manager.load_custom_model(custom_model_path)
@@ -51,10 +64,27 @@ class AutoLabeler:
             if self.current_model:
                 self.model_info = model_manager.get_model_info(self.current_model)
                 self.class_mappings = config.get('class_mappings', {})
+                self.model_task = model_task
+                
+                # 输出加载成功信息
+                model_name = f"{model_version}-{model_size}-{model_task}" if model_source == 'official' else os.path.basename(custom_model_path)
+                print("=" * 50)
+                print("AutoLabeler.load_model 模型加载成功:")
+                print(f"  模型名称: {model_name}")
+                print(f"  任务类型: {self.model_task}")
+                print(f"  模型任务 (model.task): {self.model_info.get('task', 'unknown')}")
+                print(f"  类别数量: {self.model_info.get('nc', 0)}")
+                print("=" * 50)
                 return True
+            else:
+                print("=" * 50)
+                print("AutoLabeler.load_model 模型加载失败!")
+                print("=" * 50)
             return False
         except Exception as e:
             print(f"Error loading model: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def process_single_image(self, image_path: str, image_id: int, config: Dict) -> List[Dict]:
@@ -100,8 +130,11 @@ class AutoLabeler:
         """
         annotations = []
         
+        # 获取任务类型
+        model_task = getattr(self, 'model_task', 'detect')
+        
         # 遍历检测结果
-        for box in result.boxes:
+        for i, box in enumerate(result.boxes):
             class_id = int(box.cls[0])
             conf = float(box.conf[0])
             x1, y1, x2, y2 = box.xyxy[0].tolist()
@@ -113,19 +146,119 @@ class AutoLabeler:
             # 应用类别映射
             mapped_class_id = self._map_class_id(class_id)
             
-            # 创建标注
-            annotation = {
-                'image_id': image_id,
-                'type': 'bbox',
-                'class_id': mapped_class_id,
-                'confidence': conf,
-                'data': {
-                    'x': x1,
-                    'y': y1,
-                    'width': width,
-                    'height': height
+            # 添加调试信息
+            print(f"DEBUG: model_task = {model_task}")
+            print(f"DEBUG: hasattr(result, 'masks') = {hasattr(result, 'masks')}")
+            if hasattr(result, 'masks'):
+                print(f"DEBUG: result.masks = {result.masks}")
+                print(f"DEBUG: hasattr(result.masks, 'xy') = {hasattr(result.masks, 'xy')}")
+                if hasattr(result.masks, 'xy'):
+                    print(f"DEBUG: len(result.masks.xy) = {len(result.masks.xy)}")
+            
+            if model_task == 'segment' and hasattr(result, 'masks') and result.masks:
+                # 生成segment任务的多边形标注
+                print(f"DEBUG: Generating polygon annotation for segment task")
+                if hasattr(result.masks, 'xy') and result.masks.xy is not None:
+                    # 获取多边形边界坐标
+                    # result.masks.xy 是一个列表，每个元素是一个numpy数组，形状为 (n_points, 2)
+                    if i < len(result.masks.xy):
+                        polygons = result.masks.xy[i]
+                        print(f"DEBUG: Polygon points (raw) = {polygons}")
+                        
+                        # 转换为列表格式，与手动标注保持一致
+                        points = []
+                        # polygons 是一个numpy数组，形状为 (n_points, 2)
+                        # 需要转换为Python列表并提取坐标
+                        # 处理numpy数组：如果有tolist方法，使用它
+                        if hasattr(polygons, 'tolist'):
+                            polygons_list = polygons.tolist()
+                        else:
+                            polygons_list = polygons
+                        
+                        # 遍历每个点
+                        for point in polygons_list:
+                            # point 可能是 [x, y] 列表或 (x, y) 元组或numpy数组
+                            # 处理numpy数组
+                            if hasattr(point, 'tolist'):
+                                point = point.tolist()
+                            
+                            # 检查是否是有效的点格式
+                            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                                points.append({'x': float(point[0]), 'y': float(point[1])})
+                        
+                        print(f"DEBUG: Converted points = {points}")
+                        
+                        # 如果points为空，说明转换失败，使用bbox作为备用
+                        if not points:
+                            print(f"DEBUG: Warning: Failed to convert polygon points, using bbox instead")
+                            annotation = {
+                                'image_id': image_id,
+                                'type': 'bbox',
+                                'class_id': mapped_class_id,
+                                'confidence': conf,
+                                'data': {
+                                    'x': x1,
+                                    'y': y1,
+                                    'width': width,
+                                    'height': height
+                                }
+                            }
+                        else:
+                            annotation = {
+                                'image_id': image_id,
+                                'type': 'polygon',
+                                'class_id': mapped_class_id,
+                                'confidence': conf,
+                                'data': {
+                                    'points': points
+                                }
+                            }
+                    else:
+                        # 索引超出范围，使用bbox
+                        print(f"DEBUG: Warning: Mask index {i} out of range, using bbox instead")
+                        annotation = {
+                            'image_id': image_id,
+                            'type': 'bbox',
+                            'class_id': mapped_class_id,
+                            'confidence': conf,
+                            'data': {
+                                'x': x1,
+                                'y': y1,
+                                'width': width,
+                                'height': height
+                            }
+                        }
+                else:
+                    # 没有masks.xy，使用bbox作为备用
+                    print(f"DEBUG: Warning: No masks.xy available, using bbox instead")
+                    annotation = {
+                        'image_id': image_id,
+                        'type': 'bbox',
+                        'class_id': mapped_class_id,
+                        'confidence': conf,
+                        'data': {
+                            'x': x1,
+                            'y': y1,
+                            'width': width,
+                            'height': height
+                        }
+                    }
+                print(f"DEBUG: Generated annotation type = {annotation['type']}")
+                print(f"DEBUG: Generated annotation data = {annotation['data']}")
+            else:
+                # 生成detect任务的bbox标注
+                annotation = {
+                    'image_id': image_id,
+                    'type': 'bbox',
+                    'class_id': mapped_class_id,
+                    'confidence': conf,
+                    'data': {
+                        'x': x1,
+                        'y': y1,
+                        'width': width,
+                        'height': height
+                    }
                 }
-            }
             annotations.append(annotation)
         
         return annotations
@@ -448,7 +581,7 @@ class BatchLabelingManager(QObject):
         self.model_manager = None
         self.images = []
     
-    def start_batch_processing(self, model_path: str, images: list, conf_threshold: float, iou_threshold: float, class_mapping: dict, model_manager):
+    def start_batch_processing(self, model_path: str, images: list, conf_threshold: float, iou_threshold: float, class_mapping: dict, model_manager, model_task: str = 'detect'):
         """开始批量处理
         
         Args:
@@ -458,6 +591,7 @@ class BatchLabelingManager(QObject):
             iou_threshold: IOU阈值
             class_mapping: 类别映射
             model_manager: 模型管理器实例
+            model_task: 模型任务类型，默认为'detect'
         """
         try:
             self.model_manager = model_manager
@@ -485,15 +619,23 @@ class BatchLabelingManager(QObject):
                     'model_version': version,
                     'model_size': size,
                     'model_source': 'official',
+                    'model_task': model_task,
                     'class_mappings': class_mapping
                 }
                 self.auto_labeler.load_model(load_config)
             else:
                 # 自定义模型
                 if os.path.exists(model_path):
-                    # 直接加载模型
-                    if not self.auto_labeler.current_model:
-                        self.auto_labeler.current_model = model_manager.load_custom_model(model_path)
+                    # 对于自定义模型，也需要设置model_task
+                    load_config = {
+                        'model_version': '',  # 自定义模型不需要版本
+                        'model_size': '',  # 自定义模型不需要大小
+                        'model_source': 'custom',
+                        'model_task': model_task,  # 使用传入的任务类型
+                        'custom_model_path': model_path,
+                        'class_mappings': class_mapping
+                    }
+                    self.auto_labeler.load_model(load_config)
             
             # 创建并启动线程
             self.current_thread = BatchLabelingThread(

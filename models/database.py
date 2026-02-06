@@ -527,6 +527,7 @@ class Database:
             Dict: 同步结果，包含删除的文件数量等信息
         """
         import os
+        import shutil
         
         deleted_db_count = 0
         deleted_file_count = 0
@@ -572,22 +573,57 @@ class Database:
         # 查找所有projects目录下的文件夹
         projects_dir = Path(__file__).parent.parent / "projects"
         if projects_dir.exists():
+            # 获取数据库中存在的项目列表
+            db_projects = self.get_all_projects()
+            db_project_ids = set()
+            for project in db_projects:
+                db_project_ids.add(project.get('id'))
+            
             # 遍历所有项目文件夹
             for project_folder in projects_dir.iterdir():
                 if project_folder.is_dir():
-                    # 遍历项目文件夹中的所有文件
-                    for root, dirs, files in os.walk(project_folder):
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            # 检查文件是否在数据库中存在
-                            if file_path not in db_files:
-                                # 文件不在数据库中，删除实际文件
-                                try:
-                                    os.remove(file_path)
-                                    deleted_file_count += 1
-                                    deleted_actual_files.append(file_path)
-                                except Exception:
-                                    pass  # 忽略删除失败的情况
+                    # 检查项目文件夹是否在数据库中存在
+                    # 从文件夹名中提取项目ID（格式：project_123 或 test_20260203_142707）
+                    folder_name = project_folder.name
+                    
+                    # 检查是否为项目文件夹（包含下划线）
+                    if '_' in folder_name:
+                        # 尝试从文件夹名中提取项目ID
+                        project_exists = False
+                        
+                        # 检查是否有对应的项目ID
+                        for project in db_projects:
+                            project_name = project.get('name', '')
+                            # 如果文件夹名包含项目名，认为是对应的项目文件夹
+                            if project_name in folder_name:
+                                project_exists = True
+                                break
+                        
+                        # 如果项目不在数据库中，删除整个项目文件夹
+                        if not project_exists:
+                            try:
+                                # 记录要删除的文件数量
+                                for root, dirs, files in os.walk(project_folder):
+                                    deleted_file_count += len(files)
+                                    deleted_actual_files.extend([os.path.join(root, f) for f in files])
+                                # 删除整个文件夹
+                                shutil.rmtree(project_folder)
+                            except Exception:
+                                pass  # 忽略删除失败的情况
+                        else:
+                            # 项目存在，清理项目文件夹中不存在于数据库的文件
+                            for root, dirs, files in os.walk(project_folder):
+                                for file in files:
+                                    file_path = os.path.join(root, file)
+                                    # 检查文件是否在数据库中存在
+                                    if file_path not in db_files:
+                                        # 文件不在数据库中，删除实际文件
+                                        try:
+                                            os.remove(file_path)
+                                            deleted_file_count += 1
+                                            deleted_actual_files.append(file_path)
+                                        except Exception:
+                                            pass  # 忽略删除失败的情况
         
         return {
             'deleted_db_count': deleted_db_count,
