@@ -7,3 +7,4 @@ torchvision
 pyqtgraph
 matplotlib
 numpy
+openai

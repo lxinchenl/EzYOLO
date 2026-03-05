@@ -33,6 +33,62 @@ from models.database import db
 from gui.widgets.loading_dialog import LoadingOverlay
 
 
+class SAMInferenceWorker(QThread):
+    """SAM推理工作线程"""
+    
+    inference_finished = pyqtSignal(bool, str, object)  # 成功, 消息, mask
+    
+    def __init__(self, sam_config: dict, image_path: str, points: list = None, bboxes: list = None):
+        super().__init__()
+        self.sam_config = sam_config
+        self.image_path = image_path
+        self.points = points or []
+        self.bboxes = bboxes or []
+        
+    def run(self):
+        """运行SAM推理"""
+        try:
+            sam_type = self.sam_config.get('sam_type', 'SAM')
+            model_file = self.sam_config.get('model_file', 'sam_b.pt')
+            device = self.sam_config.get('device', 'cpu')
+            
+            # 导入模型
+            if sam_type == "FastSAM":
+                from ultralytics import FastSAM
+                model = FastSAM(model_file)
+            else:
+                from ultralytics import SAM
+                model = SAM(model_file)
+            
+            # 准备提示
+            if self.points:
+                # 点提示
+                points_array = [[p[0], p[1]] for p in self.points]
+                labels = [1] * len(points_array)  # 1表示前景
+                results = model(self.image_path, points=points_array, labels=labels)
+            elif self.bboxes:
+                # 框提示
+                bbox = self.bboxes[-1]  # 使用最后一个框
+                results = model(self.image_path, bboxes=[bbox])
+            else:
+                self.inference_finished.emit(False, "没有提供提示", None)
+                return
+            
+            # 提取mask
+            if results and len(results) > 0:
+                result = results[0]
+                if hasattr(result, 'masks') and result.masks is not None:
+                    masks = result.masks.data.cpu().numpy() if hasattr(result.masks.data, 'cpu') else result.masks.data
+                    self.inference_finished.emit(True, "推理成功", masks)
+                else:
+                    self.inference_finished.emit(False, "未检测到分割结果", None)
+            else:
+                self.inference_finished.emit(False, "推理无结果", None)
+                
+        except Exception as e:
+            self.inference_finished.emit(False, f"推理出错: {str(e)}", None)
+
+
 class AnnotateImageLoadWorker(QThread):
     """标注页面图片加载工作线程"""
     
@@ -156,6 +212,17 @@ class AnnotationCanvas(QFrame):
         self.batch_process_points = []
         self.batch_process_dialog = None
         
+        # SAM标注模式
+        self.sam_mode_active = False
+        self.sam_config = None
+        self.sam_image_path = None
+        self.sam_points = []  # [(x, y), ...]
+        self.sam_bboxes = []  # [(x1, y1, x2, y2), ...]
+        self.sam_mode = 'point'  # 'point' 或 'bbox'
+        self.sam_drawing_bbox = False
+        self.sam_start_point = None
+        self.sam_current_point = None
+        
         self.init_ui()
     
     def init_ui(self):
@@ -230,6 +297,16 @@ class AnnotationCanvas(QFrame):
         # 清除关键点绘制状态
         if hasattr(self, 'keypoints'):
             self.keypoints = []
+        
+        # 处理SAM工具
+        if tool == 'sam':
+            self.sam_mode_active = True
+            self.sam_points = []
+            self.sam_bboxes = []
+            self.sam_mode = 'point'
+        else:
+            self.sam_mode_active = False
+        
         self.update()
     
     def image_to_widget(self, x: float, y: float) -> QPoint:
@@ -290,6 +367,35 @@ class AnnotationCanvas(QFrame):
         # 批量处理模式：绘制已选择的像素点
         if self.batch_process_mode and self.batch_process_points:
             self.draw_batch_process_points(painter)
+        
+        # SAM模式：绘制点和框
+        if self.sam_mode_active:
+            self.draw_sam_elements(painter)
+    
+    def draw_sam_elements(self, painter: QPainter):
+        """绘制SAM模式的点和框"""
+        # 绘制已添加的点
+        painter.setPen(QPen(QColor(0, 255, 0), 2))
+        painter.setBrush(QBrush(QColor(0, 255, 0)))
+        for i, (img_x, img_y) in enumerate(self.sam_points):
+            widget_pos = self.image_to_widget(img_x, img_y)
+            radius = 8
+            painter.drawEllipse(widget_pos, radius, radius)
+            # 绘制点编号
+            painter.setPen(QColor(255, 255, 255))
+            painter.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+            painter.drawText(widget_pos.x() + radius + 2, widget_pos.y() - radius, str(i + 1))
+            painter.setPen(QPen(QColor(0, 255, 0), 2))
+            painter.setBrush(QBrush(QColor(0, 255, 0)))
+        
+        # 绘制正在绘制的框（虚线）
+        if self.sam_drawing_bbox and self.sam_start_point and self.sam_current_point:
+            pen = QPen(QColor(255, 0, 0), 2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            rect = QRect(self.sam_start_point, self.sam_current_point)
+            painter.drawRect(rect)
     
     def draw_batch_process_points(self, painter: QPainter):
         """绘制批量处理模式下选择的像素点"""
@@ -674,6 +780,35 @@ class AnnotationCanvas(QFrame):
                 self.update()
             return
         
+        # SAM模式处理
+        if self.sam_mode_active:
+            if event.button() == Qt.MouseButton.LeftButton:
+                # 左键添加点提示
+                img_x, img_y = self.widget_to_image(event.pos().x(), event.pos().y())
+                self.sam_points.append((img_x, img_y))
+                print(f"[SAM] 添加点: ({img_x:.1f}, {img_y:.1f}), 总点数: {len(self.sam_points)}")
+                self.update()
+                
+                # 检查是否按住Ctrl
+                is_ctrl_pressed = event.modifiers() & Qt.KeyboardModifier.ControlModifier
+                print(f"[SAM] Ctrl键状态: {is_ctrl_pressed}")
+                
+                # 如果没有按住Ctrl，立即进行推理
+                if not is_ctrl_pressed:
+                    print(f"[SAM] 未按住Ctrl，开始推理...")
+                    project_type = getattr(self, 'sam_project_type', 'segment')
+                    self.run_sam_inference(project_type)
+                else:
+                    print(f"[SAM] 按住Ctrl，继续添加点...")
+                return
+            elif event.button() == Qt.MouseButton.RightButton:
+                # 右键开始画框
+                self.sam_mode = 'bbox'
+                self.sam_drawing_bbox = True
+                self.sam_start_point = event.pos()
+                self.sam_current_point = event.pos()
+                return
+        
         if event.button() == Qt.MouseButton.LeftButton:
             if self.current_tool == 'rectangle':
                 self.drawing = True
@@ -826,6 +961,12 @@ class AnnotationCanvas(QFrame):
     
     def mouseMoveEvent(self, event: QMouseEvent):
         """鼠标移动事件"""
+        # SAM模式：更新框绘制
+        if self.sam_mode_active and self.sam_drawing_bbox:
+            self.sam_current_point = event.pos()
+            self.update()
+            return
+        
         # 多边形标注：添加初始点吸附效果
         if self.current_tool == 'polygon' and len(self.polygon_points) > 0:
             initial_point = self.polygon_points[0]
@@ -915,6 +1056,23 @@ class AnnotationCanvas(QFrame):
     
     def mouseReleaseEvent(self, event: QMouseEvent):
         """鼠标释放事件"""
+        # SAM模式：右键释放完成框绘制
+        if self.sam_mode_active and event.button() == Qt.MouseButton.RightButton:
+            if self.sam_drawing_bbox:
+                self.sam_drawing_bbox = False
+                # 转换框坐标到图像坐标
+                x1, y1 = self.widget_to_image(self.sam_start_point.x(), self.sam_start_point.y())
+                x2, y2 = self.widget_to_image(self.sam_current_point.x(), self.sam_current_point.y())
+                # 确保坐标顺序正确
+                x1, x2 = min(x1, x2), max(x1, x2)
+                y1, y2 = min(y1, y2), max(y1, y2)
+                self.sam_bboxes.append((x1, y1, x2, y2))
+                self.update()
+                # 运行推理
+                project_type = getattr(self, 'sam_project_type', 'segment')
+                self.run_sam_inference(project_type)
+                return
+        
         if event.button() == Qt.MouseButton.LeftButton:
             if self.drawing and self.current_tool == 'rectangle':
                 self.drawing = False
@@ -1228,6 +1386,15 @@ class AnnotationCanvas(QFrame):
             return
         
         if event.key() == Qt.Key.Key_Escape:
+            # SAM模式：退出SAM模式
+            if self.sam_mode_active:
+                self.sam_mode_active = False
+                self.sam_points = []
+                self.sam_bboxes = []
+                self.sam_drawing_bbox = False
+                self.set_tool('rectangle')  # 切换回默认工具
+                self.update()
+                return
             # 取消当前操作
             if self.current_tool == 'polygon' and len(self.polygon_points) > 0:
                 self.polygon_points = []
@@ -1419,6 +1586,113 @@ class AnnotationCanvas(QFrame):
         
         self.annotation_created.emit(annotation)
         self.polygon_points = []
+    
+    def run_sam_inference(self, project_type: str = 'segment'):
+        """运行SAM推理"""
+        print(f"[SAM] run_sam_inference被调用")
+        print(f"[SAM] sam_config: {self.sam_config is not None}, sam_image_path: {self.sam_image_path}")
+        print(f"[SAM] 点数: {len(self.sam_points)}, 框数: {len(self.sam_bboxes)}")
+        
+        if not self.sam_config or not self.sam_image_path:
+            print(f"[SAM] 缺少配置或图片路径，无法推理")
+            return
+        
+        if not self.sam_points and not self.sam_bboxes:
+            print(f"[SAM] 没有点或框提示，无法推理")
+            return
+        
+        # 保存项目类型供回调使用
+        self.sam_project_type = project_type
+        
+        # 创建推理线程
+        print(f"[SAM] 创建推理线程...")
+        self.sam_worker = SAMInferenceWorker(
+            self.sam_config,
+            self.sam_image_path,
+            points=self.sam_points,
+            bboxes=self.sam_bboxes
+        )
+        self.sam_worker.inference_finished.connect(
+            lambda success, msg, masks: self.on_sam_inference_finished(success, msg, masks, self.sam_project_type)
+        )
+        self.sam_worker.start()
+        print(f"[SAM] 推理线程已启动")
+    
+    def on_sam_inference_finished(self, success: bool, message: str, masks, project_type: str = 'segment'):
+        """SAM推理完成回调"""
+        print(f"[SAM] 推理完成: success={success}, message={message}, project_type={project_type}")
+        
+        if success and masks is not None and len(masks) > 0:
+            # 使用第一个mask
+            mask = masks[0]
+            if len(mask.shape) > 2:
+                mask = mask.squeeze()
+            
+            if project_type == 'detect':
+                # detect任务：提取边界框
+                mask_uint8 = (mask > 0).astype(np.uint8) * 255
+                contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                if contours:
+                    # 获取最大轮廓的边界框
+                    largest_contour = max(contours, key=cv2.contourArea)
+                    x, y, w, h = cv2.boundingRect(largest_contour)
+                    
+                    # 创建矩形标注
+                    annotation = {
+                        'type': 'bbox',
+                        'class_id': self.current_class_id,
+                        'data': {
+                            'x': float(x),
+                            'y': float(y),
+                            'width': float(w),
+                            'height': float(h)
+                        }
+                    }
+                    
+                    self.annotation_created.emit(annotation)
+                    print(f"[SAM] 创建矩形标注: ({x:.1f}, {y:.1f}, {w:.1f}, {h:.1f})")
+            else:
+                # segment或其他任务：创建多边形标注
+                mask_uint8 = (mask > 0).astype(np.uint8) * 255
+                contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                if contours:
+                    # 获取最大轮廓
+                    largest_contour = max(contours, key=cv2.contourArea)
+                    
+                    # 简化轮廓
+                    epsilon = 0.005 * cv2.arcLength(largest_contour, True)
+                    approx_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
+                    
+                    # 转换为点列表
+                    points = []
+                    for point in approx_contour:
+                        x, y = point[0]
+                        points.append({'x': float(x), 'y': float(y)})
+                    
+                    # 创建多边形标注
+                    annotation = {
+                        'type': 'polygon',
+                        'class_id': self.current_class_id,
+                        'data': {
+                            'points': points
+                        }
+                    }
+                    
+                    self.annotation_created.emit(annotation)
+                    print(f"[SAM] 创建多边形标注，点数: {len(points)}")
+            
+            # 清除SAM状态
+            self.sam_points = []
+            self.sam_bboxes = []
+            self.update()
+        else:
+            # 推理失败，清除状态
+            print(f"[SAM] 推理失败或没有结果")
+            self.sam_points = []
+            self.sam_bboxes = []
+            self.update()
     
     def create_obb_annotation_with_points(self):
         """根据三个点创建旋转矩形标注"""
@@ -1756,6 +2030,54 @@ class AnnotatePage(QWidget):
         )
         toolbar.addWidget(self.btn_auto_label)
         
+        # SAM自动标注按钮
+        toolbar.addSeparator()
+        self.btn_sam = QPushButton("🎯 SAM")
+        self.btn_sam.setToolTip("使用SAM进行交互式分割标注")
+        self.btn_sam.clicked.connect(self.start_sam_annotation)
+        sam_btn_style = (
+            f"QPushButton {{"
+            f"    background-color: {COLORS['success']};"
+            f"    color: white;"
+            f"    border: none;"
+            f"    border-radius: 4px;"
+            f"    padding: 6px 12px;"
+            f"    font-weight: bold;"
+            f"}}"
+            f"QPushButton:hover {{"
+            f"    background-color: {COLORS['success']};"
+            f"}}"
+        )
+        self.btn_sam.setStyleSheet(sam_btn_style)
+        toolbar.addWidget(self.btn_sam)
+        
+        # LLM自动标注按钮
+        toolbar.addSeparator()
+        self.btn_llm_label = QPushButton("🧠 LLM")
+        self.btn_llm_label.setToolTip("使用多模态大模型进行自动标注")
+        self.btn_llm_label.setMenu(self.create_llm_menu())
+        llm_btn_style = (
+            f"QPushButton {{"
+            f"    background-color: {COLORS['warning']};"
+            f"    color: white;"
+            f"    border: none;"
+            f"    border-radius: 4px;"
+            f"    padding: 6px 12px;"
+            f"    font-weight: bold;"
+            f"}}"
+            f"QPushButton:hover {{"
+            f"    background-color: {COLORS['warning']};"
+            f"}}"
+            f"QPushButton::menu-indicator {{"
+            f"    image: none;"
+            f"}}"
+            f"QPushButton::menu-indicator::hover {{"
+            f"    image: none;"
+            f"}}"
+        )
+        self.btn_llm_label.setStyleSheet(llm_btn_style)
+        toolbar.addWidget(self.btn_llm_label)
+        
         # 批量处理按钮
         toolbar.addSeparator()
         self.btn_batch_process = QPushButton("📋 批量处理")
@@ -1939,6 +2261,20 @@ Esc - 取消操作
         # 批量推理选项
         action_batch = menu.addAction("📋 批量推理")
         action_batch.triggered.connect(self.run_batch_inference)
+        
+        return menu
+    
+    def create_llm_menu(self) -> QMenu:
+        """创建LLM自动标注下拉菜单"""
+        menu = QMenu()
+        
+        # 单张推理选项
+        action_single = menu.addAction("🔍 单张推理")
+        action_single.triggered.connect(self.run_llm_single_inference)
+        
+        # 批量推理选项
+        action_batch = menu.addAction("📋 批量推理")
+        action_batch.triggered.connect(self.run_llm_batch_inference)
         
         return menu
     
@@ -2270,6 +2606,65 @@ Esc - 取消操作
                     # 更新界面
                     self.update_class_list()
                     QMessageBox.information(self, "成功", "类别列表已更新")
+    
+    def start_sam_annotation(self):
+        """开始SAM交互式标注"""
+        if not self.current_project_id:
+            QMessageBox.warning(self, "提示", "请先选择一个项目")
+            return
+        
+        if not self.current_image_id:
+            QMessageBox.warning(self, "提示", "请先选择一张图片")
+            return
+        
+        # 获取当前图片路径
+        current_image = None
+        for img in self.images:
+            if img['id'] == self.current_image_id:
+                current_image = img
+                break
+        
+        if not current_image:
+            QMessageBox.warning(self, "提示", "无法获取当前图片信息")
+            return
+        
+        image_path = current_image.get('storage_path', '')
+        if not image_path or not os.path.exists(image_path):
+            QMessageBox.warning(self, "提示", "图片文件不存在")
+            return
+        
+        # 获取SAM配置
+        from gui.pages.auto_label_dialog import AutoLabelDialog
+        temp_dialog = AutoLabelDialog(self, self.classes)
+        sam_config = temp_dialog.get_sam_config()
+        temp_dialog.deleteLater()
+        
+        if not sam_config or not sam_config.get('model_file'):
+            QMessageBox.warning(self, "提示", "请先配置SAM模型\n点击: 自动标注 → 设置 → SAM自动标注")
+            return
+        
+        # 获取项目类型
+        project = db.get_project(self.current_project_id)
+        project_type = project.get('type', 'detect') if isinstance(project, dict) else 'detect'
+        
+        # 进入SAM标注模式
+        self.canvas.set_tool('sam')
+        self.canvas.sam_config = sam_config
+        self.canvas.sam_image_path = image_path
+        self.canvas.sam_project_type = project_type
+        self.canvas.sam_points = []
+        self.canvas.sam_bboxes = []
+        self.canvas.sam_mode = 'point'  # 'point' 或 'bbox'
+        
+        # 显示提示
+        task_name = "边界框" if project_type == 'detect' else "分割"
+        QMessageBox.information(self, "SAM标注模式", 
+            f"进入SAM交互式标注模式 ({task_name}任务):\n"
+            "• 左键点击: 添加点提示并推理\n"
+            "• Ctrl+左键: 添加多个点（不立即推理）\n"
+            "• 右键拖拽: 绘制框提示\n"
+            "• 松开鼠标: 自动推理\n"
+            "• 按ESC键: 退出SAM模式")
     
     def show_batch_process_dialog(self):
         """显示批量处理标注对话框"""
@@ -3511,6 +3906,433 @@ Esc - 取消操作
                 
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出过程中出错:\n{str(e)}")
+    
+    def run_llm_single_inference(self):
+        """运行LLM单张推理"""
+        # 检查项目类型
+        if not self.current_project_id:
+            QMessageBox.warning(self, "提示", "请先选择一个项目")
+            return
+        
+        # 获取项目类型
+        project = db.get_project(self.current_project_id)
+        project_type = project.get('type', 'detect') if isinstance(project, dict) else 'detect'
+        
+        # 检查是否为detect任务
+        if project_type != 'detect':
+            QMessageBox.information(self, "提示", "功能还在完善，敬请期待")
+            return
+        
+        # 检查是否有选中的图片
+        if not self.current_image_id:
+            QMessageBox.warning(self, "提示", "请先选择一张图片")
+            return
+        
+        # 获取当前图片路径
+        current_image = None
+        for img in self.images:
+            if img['id'] == self.current_image_id:
+                current_image = img
+                break
+        
+        if not current_image:
+            QMessageBox.warning(self, "提示", "无法获取当前图片信息")
+            return
+        
+        image_path = current_image.get('storage_path', '')
+        if not image_path or not os.path.exists(image_path):
+            QMessageBox.warning(self, "提示", "图片文件不存在")
+            return
+        
+        # 获取当前选中的类别
+        if not self.classes or self.current_class_id >= len(self.classes):
+            QMessageBox.warning(self, "提示", "请先选择一个类别")
+            return
+        
+        target_class = self.classes[self.current_class_id]['name']
+        
+        # 获取LLM配置
+        from gui.pages.auto_label_dialog import AutoLabelDialog, LLM_CONFIG_FILE, DEFAULT_LLM_CONFIG
+        import json
+        
+        # 加载LLM配置
+        llm_config = DEFAULT_LLM_CONFIG.copy()
+        if os.path.exists(LLM_CONFIG_FILE):
+            try:
+                with open(LLM_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    saved_config = json.load(f)
+                    llm_config.update(saved_config)
+            except Exception as e:
+                print(f"加载LLM配置失败: {e}")
+        
+        # 检查API Key
+        if not llm_config.get('api_key'):
+            QMessageBox.warning(self, "提示", "请先配置LLM API Key\n点击: 自动标注 → 设置 → LLM自动标注")
+            return
+        
+        # 显示进度对话框
+        from PyQt6.QtWidgets import QProgressDialog
+        progress = QProgressDialog("正在使用LLM进行目标检测...", "取消", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setCancelButton(None)
+        progress.show()
+        
+        # 在后台线程中运行LLM推理
+        from PyQt6.QtCore import QThread, pyqtSignal
+        
+        class LLMInferenceWorker(QThread):
+            """LLM推理工作线程"""
+            inference_finished = pyqtSignal(bool, str, list)  # 成功, 消息, 检测结果
+            
+            def __init__(self, config, image_path, target):
+                super().__init__()
+                self.config = config
+                self.image_path = image_path
+                self.target = target
+            
+            def run(self):
+                try:
+                    import base64
+                    import re
+                    from openai import OpenAI
+                    
+                    # 读取图片
+                    with open(self.image_path, "rb") as f:
+                        img_base64 = base64.b64encode(f.read()).decode("utf-8")
+                    
+                    # 创建客户端
+                    client = OpenAI(
+                        api_key=self.config['api_key'],
+                        base_url=self.config['base_url']
+                    )
+                    
+                    # 格式化提示词
+                    system_prompt = self.config['system_prompt']
+                    user_prompt = self.config['user_prompt'].format(target=self.target)
+                    
+                    # 调用API
+                    completion = client.chat.completions.create(
+                        model=self.config['model_name'],
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": user_prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
+                                    }
+                                ]
+                            }
+                        ]
+                    )
+                    
+                    response_text = completion.choices[0].message.content
+                    print(f"LLM返回:\n{response_text}")
+                    
+                    # 解析返回的文本格式: target,[xmin,ymin,xmax,ymax]
+                    detections = []
+                    pattern = r'([^,\n]+),\[(\d+),(\d+),(\d+),(\d+)\]'
+                    matches = re.findall(pattern, response_text)
+                    
+                    for match in matches:
+                        label, xmin, ymin, xmax, ymax = match
+                        detections.append({
+                            "label": label.strip(),
+                            "bbox": [int(xmin), int(ymin), int(xmax), int(ymax)]
+                        })
+                    
+                    self.inference_finished.emit(True, f"检测到 {len(detections)} 个目标", detections)
+                    
+                except Exception as e:
+                    self.inference_finished.emit(False, f"推理出错: {str(e)}", [])
+        
+        # 创建并启动工作线程
+        self.llm_worker = LLMInferenceWorker(llm_config, image_path, target_class)
+        self.llm_worker.inference_finished.connect(
+            lambda success, msg, detections: self.on_llm_inference_finished(success, msg, detections, progress)
+        )
+        self.llm_worker.start()
+    
+    def on_llm_inference_finished(self, success, message, detections, progress_dialog):
+        """LLM推理完成回调"""
+        progress_dialog.close()
+        
+        if not success:
+            QMessageBox.critical(self, "错误", message)
+            return
+        
+        if not detections:
+            QMessageBox.information(self, "完成", "未检测到目标")
+            return
+        
+        # 添加检测结果为标注
+        class_id = self.current_class_id
+        added_count = 0
+        
+        for det in detections:
+            bbox = det.get("bbox", [0, 0, 0, 0])
+            xmin, ymin, xmax, ymax = bbox
+            
+            # 创建标注数据
+            annotation = {
+                'type': 'bbox',
+                'class_id': class_id,
+                'data': {
+                    'x': float(xmin),
+                    'y': float(ymin),
+                    'width': float(xmax - xmin),
+                    'height': float(ymax - ymin)
+                }
+            }
+            
+            # 保存到数据库
+            class_name = self.classes[class_id]['name'] if class_id < len(self.classes) else 'unknown'
+            ann_id = db.add_annotation(
+                image_id=self.current_image_id,
+                project_id=self.current_project_id,
+                class_id=class_id,
+                class_name=class_name,
+                annotation_type='bbox',
+                data=annotation['data']
+            )
+            
+            if ann_id:
+                added_count += 1
+        
+        # 更新图片状态
+        if added_count > 0:
+            db.update_image_status(self.current_image_id, 'annotated')
+        
+        # 重新加载标注
+        self.load_annotations()
+        self.update_image_list_display()
+        
+        QMessageBox.information(self, "完成", f"{message}\n已添加 {added_count} 个标注")
+    
+    def run_llm_batch_inference(self):
+        """运行LLM批量推理"""
+        # 检查项目类型
+        if not self.current_project_id:
+            QMessageBox.warning(self, "提示", "请先选择一个项目")
+            return
+        
+        # 获取项目类型
+        project = db.get_project(self.current_project_id)
+        project_type = project.get('type', 'detect') if isinstance(project, dict) else 'detect'
+        
+        # 检查是否为detect任务
+        if project_type != 'detect':
+            QMessageBox.information(self, "提示", "功能还在完善，敬请期待")
+            return
+        
+        # 检查是否有图片
+        if not self.images:
+            QMessageBox.warning(self, "提示", "项目中没有图片")
+            return
+        
+        # 获取当前选中的类别
+        if not self.classes or self.current_class_id >= len(self.classes):
+            QMessageBox.warning(self, "提示", "请先选择一个类别")
+            return
+        
+        target_class = self.classes[self.current_class_id]['name']
+        
+        # 获取LLM配置
+        from gui.pages.auto_label_dialog import LLM_CONFIG_FILE, DEFAULT_LLM_CONFIG
+        import json
+        
+        # 加载LLM配置
+        llm_config = DEFAULT_LLM_CONFIG.copy()
+        if os.path.exists(LLM_CONFIG_FILE):
+            try:
+                with open(LLM_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    saved_config = json.load(f)
+                    llm_config.update(saved_config)
+            except Exception as e:
+                print(f"加载LLM配置失败: {e}")
+        
+        # 检查API Key
+        if not llm_config.get('api_key'):
+            QMessageBox.warning(self, "提示", "请先配置LLM API Key\n点击: 自动标注 → 设置 → LLM自动标注")
+            return
+        
+        # 选择图片范围
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QSpinBox, QHBoxLayout, QPushButton
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("LLM批量推理")
+        dialog.setMinimumWidth(300)
+        
+        layout = QVBoxLayout(dialog)
+        
+        layout.addWidget(QLabel(f"目标类别: {target_class}"))
+        layout.addWidget(QLabel(f"总图片数: {len(self.images)}"))
+        
+        # 起始索引
+        start_layout = QHBoxLayout()
+        start_layout.addWidget(QLabel("起始图片:"))
+        start_spin = QSpinBox()
+        start_spin.setRange(1, len(self.images))
+        start_spin.setValue(1)
+        start_layout.addWidget(start_spin)
+        layout.addLayout(start_layout)
+        
+        # 结束索引
+        end_layout = QHBoxLayout()
+        end_layout.addWidget(QLabel("结束图片:"))
+        end_spin = QSpinBox()
+        end_spin.setRange(1, len(self.images))
+        end_spin.setValue(len(self.images))
+        end_layout.addWidget(end_spin)
+        layout.addLayout(end_layout)
+        
+        # 按钮
+        btn_layout = QHBoxLayout()
+        btn_ok = QPushButton("开始")
+        btn_ok.clicked.connect(dialog.accept)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(dialog.reject)
+        btn_layout.addWidget(btn_ok)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+        
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        
+        start_idx = start_spin.value() - 1
+        end_idx = end_spin.value()
+        
+        images_to_process = self.images[start_idx:end_idx]
+        
+        if not images_to_process:
+            QMessageBox.warning(self, "提示", "没有选择要处理的图片")
+            return
+        
+        # 显示进度对话框
+        from PyQt6.QtWidgets import QProgressDialog
+        progress = QProgressDialog("正在使用LLM进行批量检测...", "取消", 0, len(images_to_process), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        
+        # 批量处理
+        total_added = 0
+        processed_count = 0
+        
+        import base64
+        import re
+        from openai import OpenAI
+        
+        for i, image_data in enumerate(images_to_process):
+            if progress.wasCanceled():
+                break
+            
+            progress.setValue(i)
+            progress.setLabelText(f"正在处理: {image_data.get('filename', '')} ({i+1}/{len(images_to_process)})")
+            
+            image_path = image_data.get('storage_path', '')
+            if not image_path or not os.path.exists(image_path):
+                continue
+            
+            try:
+                # 读取图片
+                with open(image_path, "rb") as f:
+                    img_base64 = base64.b64encode(f.read()).decode("utf-8")
+                
+                # 创建客户端
+                client = OpenAI(
+                    api_key=llm_config['api_key'],
+                    base_url=llm_config['base_url']
+                )
+                
+                # 格式化提示词
+                system_prompt = llm_config['system_prompt']
+                user_prompt = llm_config['user_prompt'].format(target=target_class)
+                
+                # 调用API
+                completion = client.chat.completions.create(
+                    model=llm_config['model_name'],
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": user_prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
+                                }
+                            ]
+                        }
+                    ]
+                )
+                
+                response_text = completion.choices[0].message.content
+                
+                # 解析返回的文本格式
+                detections = []
+                pattern = r'([^,\n]+),\[(\d+),(\d+),(\d+),(\d+)\]'
+                matches = re.findall(pattern, response_text)
+                
+                for match in matches:
+                    label, xmin, ymin, xmax, ymax = match
+                    detections.append({
+                        "label": label.strip(),
+                        "bbox": [int(xmin), int(ymin), int(xmax), int(ymax)]
+                    })
+                
+                # 添加检测结果为标注
+                image_id = image_data['id']
+                class_id = self.current_class_id
+                added_count = 0
+                
+                for det in detections:
+                    bbox = det.get("bbox", [0, 0, 0, 0])
+                    xmin, ymin, xmax, ymax = bbox
+                    
+                    # 创建标注数据
+                    annotation_data = {
+                        'x': float(xmin),
+                        'y': float(ymin),
+                        'width': float(xmax - xmin),
+                        'height': float(ymax - ymin)
+                    }
+                    
+                    # 保存到数据库
+                    class_name = self.classes[class_id]['name'] if class_id < len(self.classes) else 'unknown'
+                    ann_id = db.add_annotation(
+                        image_id=image_id,
+                        project_id=self.current_project_id,
+                        class_id=class_id,
+                        class_name=class_name,
+                        annotation_type='bbox',
+                        data=annotation_data
+                    )
+                    
+                    if ann_id:
+                        added_count += 1
+                
+                if added_count > 0:
+                    db.update_image_status(image_id, 'annotated')
+                    total_added += added_count
+                
+                processed_count += 1
+                
+            except Exception as e:
+                print(f"处理图片 {image_data.get('filename', '')} 时出错: {e}")
+                continue
+        
+        progress.setValue(len(images_to_process))
+        
+        # 重新加载标注
+        self.load_annotations()
+        self.update_image_list_display()
+        
+        QMessageBox.information(self, "完成", 
+            f"批量推理完成!\n"
+            f"处理了 {processed_count} 张图片\n"
+            f"共添加 {total_added} 个标注")
     
     def export_dataset(self):
         """导出完整数据集"""

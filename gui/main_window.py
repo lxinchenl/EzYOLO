@@ -15,6 +15,7 @@ from gui.pages.import_page import ImportPage
 from gui.pages.annotate_page import AnnotatePage
 from gui.pages.train_page import TrainPage
 from gui.pages.result_page import ResultPage
+from gui.pages.test_page import TestPage
 from gui.pages.settings_page import SettingsPage
 from gui.pages.about_page import AboutPage
 from models.database import db
@@ -129,6 +130,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(btn_result)
         self.nav_buttons.append(btn_result)
         
+        # 测试按钮
+        btn_test = self.create_nav_button("⑤ 测试", 4)
+        layout.addWidget(btn_test)
+        self.nav_buttons.append(btn_test)
+        
         # 添加弹性空间
         layout.addStretch()
         
@@ -138,11 +144,11 @@ class MainWindow(QMainWindow):
         line2.setStyleSheet(f"background-color: {COLORS['border']}; max-height: 1px;")
         layout.addWidget(line2)
         
-        btn_settings = self.create_nav_button("⚙ 设置", 4)
+        btn_settings = self.create_nav_button("⚙ 设置", 5)
         layout.addWidget(btn_settings)
         self.nav_buttons.append(btn_settings)
         
-        btn_about = self.create_nav_button("ⓘ 关于", 5)
+        btn_about = self.create_nav_button("ⓘ 关于", 6)
         layout.addWidget(btn_about)
         self.nav_buttons.append(btn_about)
         
@@ -179,6 +185,10 @@ class MainWindow(QMainWindow):
         # 训练结果页面
         self.result_page = ResultPage()
         stack.addWidget(self.result_page)
+        
+        # 测试页面
+        self.test_page = TestPage()
+        stack.addWidget(self.test_page)
         
         # 设置页面
         self.settings_page = SettingsPage()
@@ -229,11 +239,19 @@ class MainWindow(QMainWindow):
                 from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.information(self, "提示", "请先在导入页面选择一个项目")
         
-        elif index == 4:  # 设置页面
+        elif index == 4:  # 测试页面
+            if current_project_id:
+                self.test_page.set_project(current_project_id)
+            else:
+                # 如果没有选择项目，提示用户
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "提示", "请先在导入页面选择一个项目")
+        
+        elif index == 5:  # 设置页面
             # 设置页面不需要项目信息
             pass
         
-        elif index == 5:  # 关于页面
+        elif index == 6:  # 关于页面
             # 关于页面不需要项目信息
             pass
     

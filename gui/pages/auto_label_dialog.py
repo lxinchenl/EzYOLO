@@ -8,14 +8,36 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QGroupBox, QFormLayout, QRadioButton, QDoubleSpinBox,
     QCheckBox, QListWidget, QListWidgetItem, QSplitter, QMessageBox,
-    QFileDialog, QScrollArea, QWidget
+    QFileDialog, QScrollArea, QWidget, QTabWidget, QTextEdit, QLineEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 import os
+import json
 from typing import Dict, List, Optional
 
 from gui.styles import COLORS
+
+# LLM配置文件路径
+LLM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'llm_config.json')
+
+# 默认LLM配置
+DEFAULT_LLM_CONFIG = {
+    'api_key': '',
+    'base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    'model_name': 'qwen-vl-max',
+    'system_prompt': '''你是面向计算机视觉数据集的目标检测标注专家，仅输出指定目标的边界框坐标。
+核心要求：
+1. 目标类别：仅处理用户指定的类别，需找出图片中所有该类别实例；
+2. 坐标格式：每个边界框以 [xmin, ymin, xmax, ymax] 格式输出；
+3. 输出格式：每行一个目标，格式为 "标签,[xmin,ymin,xmax,ymax]"；
+4. 无目标时输出空内容；
+5. 仅返回坐标数据，无任何说明文字。''',
+    'user_prompt': '''请检测图片中的所有 {target}，按以下格式返回每行一个：
+{target},[xmin,ymin,xmax,ymax]
+{target},[xmin,ymin,xmax,ymax]
+...'''
+}
 
 # 真实的Ultralytics模型配置（从train_page.py获取）
 ULTRALYTICS_MODELS = {
@@ -59,6 +81,39 @@ ULTRALYTICS_MODELS = {
         "tasks": ["detect", "classify", "obb", "pose", "segment"],
         "prefix": "yolo26",
     },
+}
+
+# SAM模型配置
+SAM_MODELS = {
+    "SAM": {
+        "models": {
+            "SAM base": "sam_b.pt",
+            "SAM large": "sam_l.pt"
+        }
+    },
+    "SAM2": {
+        "models": {
+            "SAM 2 tiny": "sam2_t.pt",
+            "SAM 2 small": "sam2_s.pt",
+            "SAM 2 base": "sam2_b.pt",
+            "SAM 2 large": "sam2_l.pt",
+            "SAM 2.1 tiny": "sam2.1_t.pt",
+            "SAM 2.1 small": "sam2.1_s.pt",
+            "SAM 2.1 base": "sam2.1_b.pt",
+            "SAM 2.1 large": "sam2.1_l.pt"
+        }
+    },
+    "MobileSAM": {
+        "models": {
+            "MobileSAM": "mobile_sam.pt"
+        }
+    },
+    "FastSAM": {
+        "models": {
+            "FastSAM-s": "FastSAM-s.pt",
+            "FastSAM-x": "FastSAM-x.pt"
+        }
+    }
 }
 
 # 型号显示名称
@@ -115,23 +170,50 @@ class AutoLabelDialog(QDialog):
         # 初始化UI
         self.init_ui()
         
+        # 加载LLM配置
+        self.load_llm_config()
+        
     def init_ui(self):
         """初始化界面"""
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(16)
         
-        # 模型选择组
-        model_group = self.create_model_selection_group()
-        main_layout.addWidget(model_group)
+        # 创建标签页
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {COLORS['border']};
+                border-radius: 6px;
+                background-color: {COLORS['panel']};
+            }}
+            QTabBar::tab {{
+                background-color: {COLORS['sidebar']};
+                color: {COLORS['text_secondary']};
+                padding: 8px 16px;
+                margin-right: 4px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {COLORS['primary']};
+                color: white;
+            }}
+        """)
         
-        # 推理参数组
-        params_group = self.create_inference_params_group()
-        main_layout.addWidget(params_group)
+        # YOLO自动标注页面
+        yolo_tab = self.create_yolo_tab()
+        self.tab_widget.addTab(yolo_tab, "🤖 YOLO自动标注")
         
-        # 类别映射组
-        mapping_group = self.create_class_mapping_group()
-        main_layout.addWidget(mapping_group)
+        # SAM自动标注页面
+        sam_tab = self.create_sam_tab()
+        self.tab_widget.addTab(sam_tab, "🎯 SAM自动标注")
+        
+        # LLM自动标注页面
+        llm_tab = self.create_llm_tab()
+        self.tab_widget.addTab(llm_tab, "🧠 LLM自动标注")
+        
+        main_layout.addWidget(self.tab_widget)
         
         # 按钮组
         button_layout = QHBoxLayout()
@@ -147,6 +229,46 @@ class AutoLabelDialog(QDialog):
         button_layout.addWidget(self.btn_cancel)
         
         main_layout.addLayout(button_layout)
+    
+    def create_yolo_tab(self) -> QWidget:
+        """创建YOLO自动标注页面"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(16)
+        
+        # 模型选择组
+        model_group = self.create_model_selection_group()
+        layout.addWidget(model_group)
+        
+        # 推理参数组
+        params_group = self.create_inference_params_group()
+        layout.addWidget(params_group)
+        
+        # 类别映射组
+        mapping_group = self.create_class_mapping_group()
+        layout.addWidget(mapping_group)
+        
+        layout.addStretch()
+        return tab
+    
+    def create_sam_tab(self) -> QWidget:
+        """创建SAM自动标注页面"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(16)
+        
+        # SAM模型选择组
+        sam_model_group = self.create_sam_model_group()
+        layout.addWidget(sam_model_group)
+        
+        # SAM推理参数组
+        sam_params_group = self.create_sam_params_group()
+        layout.addWidget(sam_params_group)
+        
+        layout.addStretch()
+        return tab
     
     def create_model_selection_group(self) -> QGroupBox:
         """创建模型选择组"""
@@ -609,6 +731,9 @@ class AutoLabelDialog(QDialog):
         print(f"  模型来源: {self.model_source}")
         print("=" * 50)
         
+        # 保存LLM配置
+        self.save_llm_config()
+        
         # 调用accept保存设置
         self.accept()
     
@@ -654,3 +779,225 @@ class AutoLabelDialog(QDialog):
         """设置项目类别"""
         self.project_classes = classes
         self.update_class_lists()
+    
+    # ==================== SAM相关方法 ====================
+    
+    def create_sam_model_group(self) -> QGroupBox:
+        """创建SAM模型选择组"""
+        group = QGroupBox("SAM模型选择")
+        group.setStyleSheet(self.get_group_style())
+        
+        layout = QFormLayout(group)
+        
+        # SAM类型选择
+        self.cb_sam_type = QComboBox()
+        self.cb_sam_type.addItems(list(SAM_MODELS.keys()))
+        self.cb_sam_type.currentTextChanged.connect(self.on_sam_type_changed)
+        layout.addRow("模型类型:", self.cb_sam_type)
+        
+        # SAM型号选择
+        self.cb_sam_model = QComboBox()
+        layout.addRow("模型型号:", self.cb_sam_model)
+        
+        # 初始化型号列表
+        self.on_sam_type_changed(self.cb_sam_type.currentText())
+        
+        # 设备选择
+        self.cb_sam_device = QComboBox()
+        self.cb_sam_device.addItems(["自动选择", "CPU", "CUDA:0", "CUDA:1", "CUDA:2", "CUDA:3"])
+        layout.addRow("设备:", self.cb_sam_device)
+        
+        return group
+    
+    def create_sam_params_group(self) -> QGroupBox:
+        """创建SAM推理参数组"""
+        group = QGroupBox("推理参数")
+        group.setStyleSheet(self.get_group_style())
+        
+        layout = QFormLayout(group)
+        
+        # 图像尺寸
+        self.sb_sam_imgsz = QDoubleSpinBox()
+        self.sb_sam_imgsz.setRange(256, 2048)
+        self.sb_sam_imgsz.setValue(1024)
+        self.sb_sam_imgsz.setSingleStep(64)
+        layout.addRow("图像尺寸:", self.sb_sam_imgsz)
+        
+        # 置信度阈值（FastSAM用）
+        self.sb_sam_conf = QDoubleSpinBox()
+        self.sb_sam_conf.setRange(0.01, 1.0)
+        self.sb_sam_conf.setValue(0.4)
+        self.sb_sam_conf.setDecimals(2)
+        self.sb_sam_conf.setSingleStep(0.05)
+        layout.addRow("置信度阈值:", self.sb_sam_conf)
+        
+        # IoU阈值（FastSAM用）
+        self.sb_sam_iou = QDoubleSpinBox()
+        self.sb_sam_iou.setRange(0.1, 1.0)
+        self.sb_sam_iou.setValue(0.9)
+        self.sb_sam_iou.setDecimals(2)
+        self.sb_sam_iou.setSingleStep(0.05)
+        layout.addRow("IoU阈值:", self.sb_sam_iou)
+        
+        # Retina masks选项（FastSAM用）
+        self.chk_sam_retina = QCheckBox("使用Retina Masks")
+        self.chk_sam_retina.setChecked(True)
+        layout.addRow(self.chk_sam_retina)
+        
+        return group
+    
+    def on_sam_type_changed(self, sam_type: str):
+        """SAM类型改变时更新型号列表"""
+        self.cb_sam_model.clear()
+        if sam_type in SAM_MODELS:
+            models = SAM_MODELS[sam_type]["models"]
+            for name, file in models.items():
+                self.cb_sam_model.addItem(f"{name} ({file})", file)
+    
+    def get_sam_config(self) -> dict:
+        """获取SAM配置"""
+        sam_type = self.cb_sam_type.currentText()
+        model_file = self.cb_sam_model.currentData()
+        
+        # 获取设备
+        device = self.cb_sam_device.currentText()
+        if device == "自动选择":
+            try:
+                import torch
+                device = '0' if torch.cuda.is_available() else 'cpu'
+            except:
+                device = 'cpu'
+        elif device == "CPU":
+            device = 'cpu'
+        elif device.startswith("CUDA:"):
+            device = device.split(":")[1]
+        
+        return {
+            'sam_type': sam_type,
+            'model_file': model_file,
+            'device': device,
+            'imgsz': int(self.sb_sam_imgsz.value()),
+            'conf': self.sb_sam_conf.value(),
+            'iou': self.sb_sam_iou.value(),
+            'retina_masks': self.chk_sam_retina.isChecked()
+        }
+    
+    # ==================== LLM相关方法 ====================
+    
+    def create_llm_tab(self) -> QWidget:
+        """创建LLM自动标注页面"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(16)
+        
+        # API配置组
+        api_group = self.create_llm_api_group()
+        layout.addWidget(api_group)
+        
+        # 提示词配置组
+        prompt_group = self.create_llm_prompt_group()
+        layout.addWidget(prompt_group)
+        
+        layout.addStretch()
+        return tab
+    
+    def create_llm_api_group(self) -> QGroupBox:
+        """创建LLM API配置组"""
+        group = QGroupBox("API配置")
+        group.setStyleSheet(self.get_group_style())
+        
+        layout = QFormLayout(group)
+        
+        # API Key
+        self.le_llm_api_key = QLineEdit()
+        self.le_llm_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.le_llm_api_key.setPlaceholderText("请输入API Key")
+        layout.addRow("API Key:", self.le_llm_api_key)
+        
+        # Base URL
+        self.le_llm_base_url = QLineEdit()
+        self.le_llm_base_url.setPlaceholderText("请输入Base URL")
+        layout.addRow("Base URL:", self.le_llm_base_url)
+        
+        # Model Name
+        self.le_llm_model_name = QLineEdit()
+        self.le_llm_model_name.setPlaceholderText("请输入模型名称")
+        layout.addRow("模型名称:", self.le_llm_model_name)
+        
+        return group
+    
+    def create_llm_prompt_group(self) -> QGroupBox:
+        """创建LLM提示词配置组"""
+        group = QGroupBox("提示词配置")
+        group.setStyleSheet(self.get_group_style())
+        
+        layout = QVBoxLayout(group)
+        
+        # 系统提示词
+        layout.addWidget(QLabel("系统提示词:"))
+        self.te_llm_system_prompt = QTextEdit()
+        self.te_llm_system_prompt.setMaximumHeight(120)
+        layout.addWidget(self.te_llm_system_prompt)
+        
+        # 用户提示词
+        layout.addWidget(QLabel("用户提示词 (使用 {target} 作为类别占位符):"))
+        self.te_llm_user_prompt = QTextEdit()
+        self.te_llm_user_prompt.setMaximumHeight(120)
+        layout.addWidget(self.te_llm_user_prompt)
+        
+        return group
+    
+    def load_llm_config(self):
+        """加载LLM配置"""
+        config = DEFAULT_LLM_CONFIG.copy()
+        
+        # 从文件加载配置
+        if os.path.exists(LLM_CONFIG_FILE):
+            try:
+                with open(LLM_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    saved_config = json.load(f)
+                    config.update(saved_config)
+            except Exception as e:
+                print(f"加载LLM配置失败: {e}")
+        
+        # 设置到UI
+        self.le_llm_api_key.setText(config.get('api_key', ''))
+        self.le_llm_base_url.setText(config.get('base_url', ''))
+        self.le_llm_model_name.setText(config.get('model_name', ''))
+        self.te_llm_system_prompt.setPlainText(config.get('system_prompt', ''))
+        self.te_llm_user_prompt.setPlainText(config.get('user_prompt', ''))
+    
+    def save_llm_config(self):
+        """保存LLM配置"""
+        config = {
+            'api_key': self.le_llm_api_key.text(),
+            'base_url': self.le_llm_base_url.text(),
+            'model_name': self.le_llm_model_name.text(),
+            'system_prompt': self.te_llm_system_prompt.toPlainText(),
+            'user_prompt': self.te_llm_user_prompt.toPlainText()
+        }
+        
+        # 确保配置目录存在
+        config_dir = os.path.dirname(LLM_CONFIG_FILE)
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir)
+        
+        # 保存到文件
+        try:
+            with open(LLM_CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            print(f"保存LLM配置失败: {e}")
+            return False
+    
+    def get_llm_config(self) -> dict:
+        """获取LLM配置"""
+        return {
+            'api_key': self.le_llm_api_key.text(),
+            'base_url': self.le_llm_base_url.text(),
+            'model_name': self.le_llm_model_name.text(),
+            'system_prompt': self.te_llm_system_prompt.toPlainText(),
+            'user_prompt': self.te_llm_user_prompt.toPlainText()
+        }

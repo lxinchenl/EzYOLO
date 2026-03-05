@@ -67,9 +67,9 @@ class AboutPage(QWidget):
         layout = QFormLayout(group)
         
         # 微信
-        wechat_label = QLabel("lxc2902689500")
+        wechat_label = QLabel("https://github.com/lxinchenl")
         wechat_label.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
-        layout.addRow("微信:", wechat_label)
+        layout.addRow("GitHub:", wechat_label)
         
         # 邮箱
         email_label = QLabel("liuxinchen0803@qq.com")
@@ -102,7 +102,7 @@ class AboutPage(QWidget):
         version_label.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
         layout.addRow("版本:", version_label)
         
-        update_label = QLabel("2026-02-06")
+        update_label = QLabel("2026-03-05")
         update_label.setStyleSheet("background-color: #252526; padding: 4px; border-radius: 4px;")
         layout.addRow("更新日期:", update_label)
         
