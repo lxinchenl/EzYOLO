@@ -16,6 +16,7 @@ from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor
 from pathlib import Path
 import os
 import json
+import shutil
 import cv2
 import numpy as np
 from typing import Dict, List, Optional, Tuple
@@ -46,6 +47,9 @@ class InferenceThread(QThread):
         self.class_mapping = class_mapping or {}  # 类别映射
         self._is_running = False
         self.model = None
+        self.output_root = Path(__file__).parent.parent.parent / "outputs"
+        self.image_output_dir = self.output_root / "test_images"
+        self.video_output_dir = self.output_root / "test_videos"
         
     def run(self):
         """运行推理"""
@@ -53,6 +57,8 @@ class InferenceThread(QThread):
         
         try:
             from ultralytics import YOLO
+            self.image_output_dir.mkdir(parents=True, exist_ok=True)
+            self.video_output_dir.mkdir(parents=True, exist_ok=True)
             
             # 加载模型
             self.log_message.emit(f"加载模型: {self.model_path}")
@@ -167,8 +173,24 @@ class InferenceThread(QThread):
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if fps <= 0:
+            fps = 25.0
         
         self.log_message.emit(f"视频信息: {width}x{height}, {fps}fps, {total_frames}帧")
+
+        # 创建输出视频（边推理边写盘，避免帧缓存导致内存暴涨）
+        app_root = Path(__file__).parent.parent.parent
+        output_video_path = self.video_output_dir / f"{Path(video_path).stem}_annotated.mp4"
+        writer = cv2.VideoWriter(
+            str(output_video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            cap.release()
+            self.log_message.emit(f"✗ 无法创建输出视频: {output_video_path}")
+            return
         
         frame_count = 0
         processed_count = 0
@@ -193,6 +215,17 @@ class InferenceThread(QThread):
                     
                     # 获取标注后的帧
                     annotated_frame = results[0].plot()
+                    # 统一输出帧尺寸，避免播放器首段出现“逐步放大/缩小”的观感
+                    if annotated_frame is not None:
+                        ah, aw = annotated_frame.shape[:2]
+                        if aw != width or ah != height:
+                            annotated_frame = cv2.resize(
+                                annotated_frame,
+                                (width, height),
+                                interpolation=cv2.INTER_LINEAR
+                            )
+                    if annotated_frame is not None:
+                        writer.write(annotated_frame)
                     
                     # 处理检测结果
                     detections = []
@@ -210,12 +243,6 @@ class InferenceThread(QThread):
                             }
                             detections.append(detection)
                     
-                    # 发送帧和检测结果
-                    self.frame_ready.emit(annotated_frame, {
-                        'frame_number': frame_count,
-                        'detections': detections
-                    })
-                    
                     processed_count += 1
                     
                 except Exception as e:
@@ -228,12 +255,14 @@ class InferenceThread(QThread):
                 self.log_message.emit(f"  已处理 {frame_count}/{total_frames} 帧")
         
         cap.release()
+        writer.release()
         
         # 发送视频处理完成信号
         result_data = {
             'source_path': video_path,
             'filename': os.path.basename(video_path),
             'is_video': True,
+            'output_video': str(output_video_path),
             'total_frames': total_frames,
             'processed_frames': processed_count,
             'fps': fps,
@@ -250,7 +279,7 @@ class InferenceThread(QThread):
             'filename': os.path.basename(source_path),
             'detections': [],
             'speed': {},
-            'annotated_image': None
+            'annotated_image_path': None
         }
         
         # 获取检测框
@@ -276,7 +305,10 @@ class InferenceThread(QThread):
         # 获取标注后的图像
         if hasattr(result, 'plot'):
             annotated_img = result.plot()
-            result_data['annotated_image'] = annotated_img
+            if annotated_img is not None:
+                output_path = self.image_output_dir / f"{Path(source_path).stem}_annotated.jpg"
+                cv2.imwrite(str(output_path), annotated_img)
+                result_data['annotated_image_path'] = str(output_path)
         
         return result_data
     
@@ -297,8 +329,9 @@ class ImageViewer(QWidget):
     
     def init_ui(self):
         """初始化界面"""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(8)
         
         # 图像标签
         self.image_label = QLabel()
@@ -311,13 +344,14 @@ class ImageViewer(QWidget):
             }}
         """)
         self.image_label.setMinimumSize(400, 300)
-        layout.addWidget(self.image_label)
+        self.layout.addWidget(self.image_label, 0, Qt.AlignmentFlag.AlignCenter)
         
         # 信息标签
         self.info_label = QLabel("未加载图像")
         self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.info_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
-        layout.addWidget(self.info_label)
+        self.layout.addWidget(self.info_label)
+        self._apply_aspect_ratio()
     
     def show_image(self, image_path: str):
         """显示图像"""
@@ -371,7 +405,19 @@ class ImageViewer(QWidget):
     def resizeEvent(self, event):
         """窗口大小改变时重新缩放图像"""
         super().resizeEvent(event)
+        self._apply_aspect_ratio()
         self._update_display()
+
+    def _apply_aspect_ratio(self):
+        """将图像显示区域固定为4:3比例。"""
+        available_w = max(1, self.width())
+        available_h = max(1, self.height() - self.info_label.sizeHint().height() - 8)
+        target_w = min(available_w, int(available_h * 4 / 3))
+        target_h = int(target_w * 3 / 4)
+        if target_h > available_h:
+            target_h = available_h
+            target_w = int(target_h * 4 / 3)
+        self.image_label.setFixedSize(max(1, target_w), max(1, target_h))
 
 
 class VideoPlayer(QWidget):
@@ -383,14 +429,19 @@ class VideoPlayer(QWidget):
         self.is_playing = False
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
-        self.video_frames = []  # 存储视频帧
+        self.video_frames = []  # 兼容旧逻辑，默认不再存完整视频帧
         self.current_frame_index = 0
+        self.video_path = None
+        self.video_cap = None
+        self.video_fps = 30.0
+        self.total_frames = 0
         self.init_ui()
     
     def init_ui(self):
         """初始化界面"""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(8)
         
         # 视频显示标签
         self.video_label = QLabel()
@@ -403,10 +454,12 @@ class VideoPlayer(QWidget):
             }}
         """)
         self.video_label.setMinimumSize(400, 300)
-        layout.addWidget(self.video_label)
+        self.layout.addWidget(self.video_label, 0, Qt.AlignmentFlag.AlignCenter)
         
         # 控制按钮
-        controls_layout = QHBoxLayout()
+        self.controls_widget = QWidget()
+        controls_layout = QHBoxLayout(self.controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
         
         self.btn_play_pause = QPushButton("▶ 播放")
         self.btn_play_pause.clicked.connect(self.toggle_play)
@@ -422,12 +475,33 @@ class VideoPlayer(QWidget):
         self.frame_label = QLabel("0 / 0")
         controls_layout.addWidget(self.frame_label)
         
-        layout.addLayout(controls_layout)
+        self.layout.addWidget(self.controls_widget)
+        self._apply_aspect_ratio()
     
     def add_frame(self, frame: np.ndarray):
         """添加视频帧"""
+        # 保留兼容能力（调试场景），正式流程不再依赖帧缓存
         self.video_frames.append(frame.copy())
         self.frame_label.setText(f"{self.current_frame_index + 1} / {len(self.video_frames)}")
+        if len(self.video_frames) == 1 and not self.is_playing:
+            self.display_frame(self.video_frames[0])
+
+    def load_video(self, video_path: str):
+        """加载视频文件进行播放（无帧缓存模式）。"""
+        self.clear()
+        self.video_path = video_path
+        self.video_cap = cv2.VideoCapture(video_path)
+        if not self.video_cap.isOpened():
+            self.video_cap = None
+            self.frame_label.setText("0 / 0")
+            return
+
+        self.video_fps = self.video_cap.get(cv2.CAP_PROP_FPS)
+        if self.video_fps <= 0:
+            self.video_fps = 30.0
+        self.total_frames = int(self.video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.current_frame_index = 0
+        self._seek_and_show_first_frame()
     
     def toggle_play(self):
         """切换播放/暂停"""
@@ -438,6 +512,13 @@ class VideoPlayer(QWidget):
     
     def play(self):
         """开始播放"""
+        if self.video_cap is not None:
+            self.is_playing = True
+            self.btn_play_pause.setText("⏸ 暂停")
+            interval = max(1, int(1000 / self.video_fps))
+            self.timer.start(interval)
+            return
+
         if not self.video_frames:
             return
         self.is_playing = True
@@ -455,12 +536,26 @@ class VideoPlayer(QWidget):
         self.is_playing = False
         self.btn_play_pause.setText("▶ 播放")
         self.timer.stop()
+        if self.video_cap is not None:
+            self.current_frame_index = 0
+            self._seek_and_show_first_frame()
+            return
         self.current_frame_index = 0
         if self.video_frames:
             self.display_frame(self.video_frames[0])
     
     def update_frame(self):
         """更新帧"""
+        if self.video_cap is not None:
+            ret, frame = self.video_cap.read()
+            if not ret:
+                self.stop()
+                return
+            self.display_frame(frame)
+            self.current_frame_index += 1
+            self.frame_label.setText(f"{self.current_frame_index} / {self.total_frames}")
+            return
+
         if not self.video_frames:
             return
         
@@ -476,6 +571,7 @@ class VideoPlayer(QWidget):
         """显示单帧"""
         if frame is None:
             return
+        self.current_frame = frame
         
         # 转换BGR到RGB
         if len(frame.shape) == 3 and frame.shape[2] == 3:
@@ -490,8 +586,11 @@ class VideoPlayer(QWidget):
         pixmap = QPixmap.fromImage(q_image)
         
         # 缩放以适应窗口
+        target_size = self.video_label.contentsRect().size()
+        if target_size.width() <= 1 or target_size.height() <= 1:
+            target_size = self.video_label.size()
         scaled_pixmap = pixmap.scaled(
-            self.video_label.size(),
+            target_size,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation
         )
@@ -499,16 +598,53 @@ class VideoPlayer(QWidget):
     
     def clear(self):
         """清空视频帧"""
+        self.timer.stop()
+        self.is_playing = False
+        self.btn_play_pause.setText("▶ 播放")
+        if self.video_cap is not None:
+            self.video_cap.release()
+            self.video_cap = None
+        self.video_path = None
+        self.video_fps = 30.0
+        self.total_frames = 0
         self.video_frames.clear()
         self.current_frame_index = 0
+        self.current_frame = None
         self.video_label.clear()
         self.frame_label.setText("0 / 0")
+
+    def _seek_and_show_first_frame(self):
+        """跳转到第一帧并显示。"""
+        if self.video_cap is None:
+            return
+        self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ret, frame = self.video_cap.read()
+        if ret:
+            self.display_frame(frame)
+            self.current_frame_index = 1
+            self.frame_label.setText(f"{self.current_frame_index} / {self.total_frames}")
+            # 回到起点，保证播放从第一帧开始
+            self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.current_frame_index = 0
     
     def resizeEvent(self, event):
         """窗口大小改变时重新缩放"""
         super().resizeEvent(event)
-        if self.video_frames and self.current_frame_index < len(self.video_frames):
-            self.display_frame(self.video_frames[self.current_frame_index])
+        self._apply_aspect_ratio()
+        if self.current_frame is not None:
+            self.display_frame(self.current_frame)
+
+    def _apply_aspect_ratio(self):
+        """将视频显示区域固定为4:3比例。"""
+        controls_h = self.controls_widget.sizeHint().height() if hasattr(self, "controls_widget") else 0
+        available_w = max(1, self.width())
+        available_h = max(1, self.height() - controls_h - 8)
+        target_w = min(available_w, int(available_h * 4 / 3))
+        target_h = int(target_w * 3 / 4)
+        if target_h > available_h:
+            target_h = available_h
+            target_w = int(target_h * 4 / 3)
+        self.video_label.setFixedSize(max(1, target_w), max(1, target_h))
 
 
 class TestPage(QWidget):
@@ -526,8 +662,18 @@ class TestPage(QWidget):
         self.video_frames = []  # 视频帧缓存
         self.class_mapping = {}  # 类别映射
         self.model_classes = []  # 模型类别列表
+        self.output_root = Path(__file__).parent.parent.parent / "outputs"
+        self._clear_test_outputs_on_startup()
         
         self.init_ui()
+
+    def _clear_test_outputs_on_startup(self):
+        """页面启动时清空测试输出文件。"""
+        for folder in ("test_images", "test_videos"):
+            path = self.output_root / folder
+            if path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+            path.mkdir(parents=True, exist_ok=True)
     
     def set_project(self, project_id: int):
         """设置当前项目"""
@@ -1470,10 +1616,7 @@ class TestPage(QWidget):
     
     def on_frame_ready(self, frame: np.ndarray, detection_info: dict):
         """视频帧就绪"""
-        # 添加到视频播放器
-        self.video_player.add_frame(frame)
-        
-        # 如果是第一帧，切换到视频标签页
+        # 保留接口兼容；当前视频流程改为写盘后播放，不再使用内存帧缓存
         if detection_info.get('frame_number') == 0:
             self.result_tabs.setCurrentIndex(1)  # 切换到视频标签页
     
@@ -1489,17 +1632,16 @@ class TestPage(QWidget):
         if result.get('is_video'):
             # 切换到视频标签页
             self.result_tabs.setCurrentIndex(1)
-            # 视频已经在on_frame_ready中添加了
+            video_to_play = result.get('output_video') or result.get('source_path')
+            if video_to_play and os.path.exists(video_to_play):
+                self.video_player.load_video(video_to_play)
         else:
             # 切换到图像标签页
             self.result_tabs.setCurrentIndex(0)
             
-            # 显示标注后的图像
-            if result.get('annotated_image') is not None:
-                self.image_viewer.show_array(result['annotated_image'])
-            else:
-                # 显示原图
-                self.image_viewer.show_image(result['source_path'])
+            # 显示写盘后的标注图像
+            image_to_show = result.get('annotated_image_path') or result.get('source_path')
+            self.image_viewer.show_image(image_to_show)
         
         # 更新结果信息
         info_text = f"""

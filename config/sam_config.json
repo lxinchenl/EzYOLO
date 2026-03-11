@@ -1,0 +1,9 @@
+{
+  "sam_type": "SAM2",
+  "model_file": "sam2.1_b.pt",
+  "device": "0",
+  "imgsz": 1024,
+  "conf": 0.4,
+  "iou": 0.9,
+  "retina_masks": true
+}

@@ -44,32 +44,66 @@ class SAMInferenceWorker(QThread):
         self.image_path = image_path
         self.points = points or []
         self.bboxes = bboxes or []
+
+    def _build_predict_kwargs(self) -> dict:
+        """构建统一推理参数，确保UI配置生效。"""
+        kwargs = {"verbose": False}
+        if self.sam_config.get('imgsz'):
+            kwargs["imgsz"] = int(self.sam_config['imgsz'])
+        if self.sam_config.get('device') is not None:
+            kwargs["device"] = self.sam_config['device']
+        if self.sam_config.get('retina_masks') is not None:
+            kwargs["retina_masks"] = bool(self.sam_config['retina_masks'])
+        return kwargs
         
     def run(self):
         """运行SAM推理"""
         try:
             sam_type = self.sam_config.get('sam_type', 'SAM')
             model_file = self.sam_config.get('model_file', 'sam_b.pt')
-            device = self.sam_config.get('device', 'cpu')
             
-            # 导入模型
+            # 检查模型文件是否存在
+            import os
+            model_paths = [
+                model_file,
+                os.path.join('models', model_file),
+                os.path.join(os.path.expanduser('~'), '.cache', 'ultralytics', model_file),
+            ]
+            
+            model_path = None
+            for path in model_paths:
+                if os.path.exists(path):
+                    model_path = path
+                    break
+            
+            if model_path is None:
+                self.inference_finished.emit(False, f"模型文件不存在: {model_file}\n请下载模型后重试", None)
+                return
+            
+            # 导入模型 - 根据类型使用正确的类
             if sam_type == "FastSAM":
                 from ultralytics import FastSAM
-                model = FastSAM(model_file)
+                model = FastSAM(model_path)
             else:
+                # SAM, SAM2, MobileSAM 都使用SAM类
                 from ultralytics import SAM
-                model = SAM(model_file)
+                model = SAM(model_path)
+
+            predict_kwargs = self._build_predict_kwargs()
+            if sam_type == "FastSAM":
+                predict_kwargs["conf"] = float(self.sam_config.get("conf", 0.4))
+                predict_kwargs["iou"] = float(self.sam_config.get("iou", 0.9))
             
             # 准备提示
             if self.points:
                 # 点提示
                 points_array = [[p[0], p[1]] for p in self.points]
                 labels = [1] * len(points_array)  # 1表示前景
-                results = model(self.image_path, points=points_array, labels=labels)
+                results = model(self.image_path, points=points_array, labels=labels, **predict_kwargs)
             elif self.bboxes:
                 # 框提示
                 bbox = self.bboxes[-1]  # 使用最后一个框
-                results = model(self.image_path, bboxes=[bbox])
+                results = model(self.image_path, bboxes=[bbox], **predict_kwargs)
             else:
                 self.inference_finished.emit(False, "没有提供提示", None)
                 return
@@ -79,7 +113,12 @@ class SAMInferenceWorker(QThread):
                 result = results[0]
                 if hasattr(result, 'masks') and result.masks is not None:
                     masks = result.masks.data.cpu().numpy() if hasattr(result.masks.data, 'cpu') else result.masks.data
-                    self.inference_finished.emit(True, "推理成功", masks)
+                    scores = None
+                    if hasattr(result, 'boxes') and result.boxes is not None and hasattr(result.boxes, 'conf'):
+                        confs = result.boxes.conf
+                        if confs is not None:
+                            scores = confs.cpu().numpy() if hasattr(confs, 'cpu') else confs
+                    self.inference_finished.emit(True, "推理成功", {"masks": masks, "scores": scores})
                 else:
                     self.inference_finished.emit(False, "未检测到分割结果", None)
             else:
@@ -785,21 +824,21 @@ class AnnotationCanvas(QFrame):
             if event.button() == Qt.MouseButton.LeftButton:
                 # 左键添加点提示
                 img_x, img_y = self.widget_to_image(event.pos().x(), event.pos().y())
+                if self.current_image:
+                    img_w = self.current_image.width()
+                    img_h = self.current_image.height()
+                    img_x = max(0, min(img_x, img_w - 1))
+                    img_y = max(0, min(img_y, img_h - 1))
                 self.sam_points.append((img_x, img_y))
-                print(f"[SAM] 添加点: ({img_x:.1f}, {img_y:.1f}), 总点数: {len(self.sam_points)}")
                 self.update()
                 
                 # 检查是否按住Ctrl
                 is_ctrl_pressed = event.modifiers() & Qt.KeyboardModifier.ControlModifier
-                print(f"[SAM] Ctrl键状态: {is_ctrl_pressed}")
                 
                 # 如果没有按住Ctrl，立即进行推理
                 if not is_ctrl_pressed:
-                    print(f"[SAM] 未按住Ctrl，开始推理...")
                     project_type = getattr(self, 'sam_project_type', 'segment')
                     self.run_sam_inference(project_type)
-                else:
-                    print(f"[SAM] 按住Ctrl，继续添加点...")
                 return
             elif event.button() == Qt.MouseButton.RightButton:
                 # 右键开始画框
@@ -1589,23 +1628,16 @@ class AnnotationCanvas(QFrame):
     
     def run_sam_inference(self, project_type: str = 'segment'):
         """运行SAM推理"""
-        print(f"[SAM] run_sam_inference被调用")
-        print(f"[SAM] sam_config: {self.sam_config is not None}, sam_image_path: {self.sam_image_path}")
-        print(f"[SAM] 点数: {len(self.sam_points)}, 框数: {len(self.sam_bboxes)}")
-        
         if not self.sam_config or not self.sam_image_path:
-            print(f"[SAM] 缺少配置或图片路径，无法推理")
             return
         
         if not self.sam_points and not self.sam_bboxes:
-            print(f"[SAM] 没有点或框提示，无法推理")
             return
         
         # 保存项目类型供回调使用
         self.sam_project_type = project_type
         
         # 创建推理线程
-        print(f"[SAM] 创建推理线程...")
         self.sam_worker = SAMInferenceWorker(
             self.sam_config,
             self.sam_image_path,
@@ -1616,72 +1648,97 @@ class AnnotationCanvas(QFrame):
             lambda success, msg, masks: self.on_sam_inference_finished(success, msg, masks, self.sam_project_type)
         )
         self.sam_worker.start()
-        print(f"[SAM] 推理线程已启动")
     
     def on_sam_inference_finished(self, success: bool, message: str, masks, project_type: str = 'segment'):
         """SAM推理完成回调"""
-        print(f"[SAM] 推理完成: success={success}, message={message}, project_type={project_type}")
-        
-        if success and masks is not None and len(masks) > 0:
-            # 使用第一个mask
-            mask = masks[0]
-            if len(mask.shape) > 2:
-                mask = mask.squeeze()
+
+        mask_array = masks
+        mask_scores = None
+        if isinstance(masks, dict):
+            mask_array = masks.get("masks")
+            mask_scores = masks.get("scores")
+
+        if mask_array is not None and not isinstance(mask_array, np.ndarray):
+            mask_array = np.asarray(mask_array)
+
+        if success and mask_array is not None and len(mask_array) > 0:
+            # SAM常返回多个候选mask，优先取最高分mask，避免并集导致过分膨胀
+            if len(mask_array.shape) == 2:
+                selected_mask = mask_array
+            else:
+                selected_index = 0
+                if mask_scores is not None and len(mask_scores) == len(mask_array):
+                    selected_index = int(np.argmax(mask_scores))
+                selected_mask = mask_array[selected_index]
+
+            if len(selected_mask.shape) > 2:
+                selected_mask = selected_mask.squeeze()
+            mask_uint8 = (selected_mask > 0).astype(np.uint8) * 255
+            
+            # 查找所有轮廓
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if not contours:
+                self.sam_points = []
+                self.sam_bboxes = []
+                self.update()
+                return
+            
+            # 获取所有轮廓的边界框（合并所有轮廓）
+            all_x, all_y, all_x2, all_y2 = [], [], [], []
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                all_x.append(x)
+                all_y.append(y)
+                all_x2.append(x + w)
+                all_y2.append(y + h)
+            
+            # 计算合并后的边界框
+            min_x = min(all_x)
+            min_y = min(all_y)
+            max_x2 = max(all_x2)
+            max_y2 = max(all_y2)
+            total_w = max_x2 - min_x
+            total_h = max_y2 - min_y
             
             if project_type == 'detect':
-                # detect任务：提取边界框
-                mask_uint8 = (mask > 0).astype(np.uint8) * 255
-                contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                if contours:
-                    # 获取最大轮廓的边界框
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    x, y, w, h = cv2.boundingRect(largest_contour)
-                    
-                    # 创建矩形标注
-                    annotation = {
-                        'type': 'bbox',
-                        'class_id': self.current_class_id,
-                        'data': {
-                            'x': float(x),
-                            'y': float(y),
-                            'width': float(w),
-                            'height': float(h)
-                        }
+                # detect任务：创建合并后的边界框
+                annotation = {
+                    'type': 'bbox',
+                    'class_id': self.current_class_id,
+                    'data': {
+                        'x': float(min_x),
+                        'y': float(min_y),
+                        'width': float(total_w),
+                        'height': float(total_h)
                     }
-                    
-                    self.annotation_created.emit(annotation)
-                    print(f"[SAM] 创建矩形标注: ({x:.1f}, {y:.1f}, {w:.1f}, {h:.1f})")
+                }
+                
+                self.annotation_created.emit(annotation)
             else:
-                # segment或其他任务：创建多边形标注
-                mask_uint8 = (mask > 0).astype(np.uint8) * 255
-                contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                # segment或其他任务：创建多边形标注（使用最大轮廓）
+                largest_contour = max(contours, key=cv2.contourArea)
                 
-                if contours:
-                    # 获取最大轮廓
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    
-                    # 简化轮廓
-                    epsilon = 0.005 * cv2.arcLength(largest_contour, True)
-                    approx_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
-                    
-                    # 转换为点列表
-                    points = []
-                    for point in approx_contour:
-                        x, y = point[0]
-                        points.append({'x': float(x), 'y': float(y)})
-                    
-                    # 创建多边形标注
-                    annotation = {
-                        'type': 'polygon',
-                        'class_id': self.current_class_id,
-                        'data': {
-                            'points': points
-                        }
+                # 简化轮廓
+                epsilon = 0.005 * cv2.arcLength(largest_contour, True)
+                approx_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
+                
+                # 转换为点列表
+                points = []
+                for point in approx_contour:
+                    x, y = point[0]
+                    points.append({'x': float(x), 'y': float(y)})
+                
+                # 创建多边形标注
+                annotation = {
+                    'type': 'polygon',
+                    'class_id': self.current_class_id,
+                    'data': {
+                        'points': points
                     }
-                    
-                    self.annotation_created.emit(annotation)
-                    print(f"[SAM] 创建多边形标注，点数: {len(points)}")
+                }
+                
+                self.annotation_created.emit(annotation)
             
             # 清除SAM状态
             self.sam_points = []
@@ -1689,7 +1746,6 @@ class AnnotationCanvas(QFrame):
             self.update()
         else:
             # 推理失败，清除状态
-            print(f"[SAM] 推理失败或没有结果")
             self.sam_points = []
             self.sam_bboxes = []
             self.update()
@@ -2633,11 +2689,8 @@ Esc - 取消操作
             QMessageBox.warning(self, "提示", "图片文件不存在")
             return
         
-        # 获取SAM配置
-        from gui.pages.auto_label_dialog import AutoLabelDialog
-        temp_dialog = AutoLabelDialog(self, self.classes)
-        sam_config = temp_dialog.get_sam_config()
-        temp_dialog.deleteLater()
+        # 获取已保存的SAM配置（避免临时弹窗回落到默认值）
+        sam_config = AutoLabelDialog.get_saved_sam_config()
         
         if not sam_config or not sam_config.get('model_file'):
             QMessageBox.warning(self, "提示", "请先配置SAM模型\n点击: 自动标注 → 设置 → SAM自动标注")
@@ -3242,6 +3295,13 @@ Esc - 取消操作
         # 加载到画布
         if image_data.get('storage_path'):
             self.canvas.load_image(image_data['storage_path'])
+            # SAM模式下切图时，同步推理上下文到当前图片，避免继续使用旧图推理
+            if self.canvas.sam_mode_active:
+                self.canvas.sam_image_path = image_data['storage_path']
+                self.canvas.sam_config = AutoLabelDialog.get_saved_sam_config()
+                self.canvas.sam_points = []
+                self.canvas.sam_bboxes = []
+                self.canvas.sam_drawing_bbox = False
         
         # 加载标注
         self.load_annotations()
@@ -4410,6 +4470,10 @@ Esc - 取消操作
                             ann_type = ann.get('type', 'bbox')
                             data = ann.get('data', {})
                             
+                            # 获取图片尺寸
+                            img_width = image.get('width', 1920)  # 默认宽度
+                            img_height = image.get('height', 1080)  # 默认高度
+                            
                             if ann_type == 'bbox':
                                 # YOLO格式：class_id x_center y_center width height
                                 x = data.get('x', 0)
@@ -4418,9 +4482,6 @@ Esc - 取消操作
                                 height = data.get('height', 0)
                                 
                                 # 计算中心点和归一化
-                                img_width = image.get('width', 1920)  # 默认宽度
-                                img_height = image.get('height', 1080)  # 默认高度
-                                
                                 x_center = (x + width/2) / img_width
                                 y_center = (y + height/2) / img_height
                                 norm_width = width / img_width
@@ -4428,6 +4489,28 @@ Esc - 取消操作
                                 
                                 # 写入文件
                                 f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {norm_width:.6f} {norm_height:.6f}\n")
+                            
+                            elif ann_type == 'polygon':
+                                # YOLO分割格式：class_id x1 y1 x2 y2 ... xn yn
+                                points = data.get('points', [])
+                                if points:
+                                    # 构建归一化的多边形坐标
+                                    normalized_points = []
+                                    for point in points:
+                                        if isinstance(point, dict):
+                                            x = point.get('x', 0)
+                                            y = point.get('y', 0)
+                                        elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                                            x, y = point[0], point[1]
+                                        else:
+                                            continue
+                                        norm_x = x / img_width
+                                        norm_y = y / img_height
+                                        normalized_points.extend([f"{norm_x:.6f}", f"{norm_y:.6f}"])
+                                    
+                                    if normalized_points:
+                                        # 写入文件
+                                        f.write(f"{class_id} {' '.join(normalized_points)}\n")
                     
                     exported_count += 1
             

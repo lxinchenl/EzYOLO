@@ -20,6 +20,7 @@ from gui.styles import COLORS
 
 # LLM配置文件路径
 LLM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'llm_config.json')
+SAM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'sam_config.json')
 
 # 默认LLM配置
 DEFAULT_LLM_CONFIG = {
@@ -37,6 +38,16 @@ DEFAULT_LLM_CONFIG = {
 {target},[xmin,ymin,xmax,ymax]
 {target},[xmin,ymin,xmax,ymax]
 ...'''
+}
+
+DEFAULT_SAM_CONFIG = {
+    "sam_type": "SAM",
+    "model_file": "sam_b.pt",
+    "device": "cpu",
+    "imgsz": 1024,
+    "conf": 0.4,
+    "iou": 0.9,
+    "retina_masks": True,
 }
 
 # 真实的Ultralytics模型配置（从train_page.py获取）
@@ -169,6 +180,9 @@ class AutoLabelDialog(QDialog):
         
         # 初始化UI
         self.init_ui()
+
+        # 加载SAM配置
+        self.load_sam_config()
         
         # 加载LLM配置
         self.load_llm_config()
@@ -731,11 +745,108 @@ class AutoLabelDialog(QDialog):
         print(f"  模型来源: {self.model_source}")
         print("=" * 50)
         
+        # 检查SAM模型是否存在
+        if hasattr(self, 'cb_sam_type') and hasattr(self, 'cb_sam_model'):
+            sam_type = self.cb_sam_type.currentText()
+            model_file = self.cb_sam_model.currentData()
+            
+            if model_file:
+                # 检查模型文件是否存在
+                model_paths = [
+                    model_file,
+                    os.path.join('models', model_file),
+                    os.path.join(os.path.expanduser('~'), '.cache', 'ultralytics', model_file),
+                ]
+                
+                model_exists = False
+                for path in model_paths:
+                    if os.path.exists(path):
+                        model_exists = True
+                        break
+                
+                if not model_exists:
+                    # 模型不存在，提示用户下载
+                    reply = QMessageBox.question(
+                        self,
+                        "模型不存在",
+                        f"SAM模型文件不存在: {model_file}\n\n"
+                        f"模型类型: {sam_type}\n"
+                        f"需要下载模型才能使用SAM功能。\n\n"
+                        f"是否现在下载？\n"
+                        f"（下载可能需要一些时间，取决于网络状况）",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    
+                    if reply == QMessageBox.StandardButton.Yes:
+                        # 尝试下载模型
+                        self.download_sam_model(sam_type, model_file)
+                    else:
+                        # 用户选择不下载，清空SAM配置
+                        print(f"[SAM] 用户选择不下载模型，SAM功能将不可用")
+        
+        # 保存SAM配置
+        self.save_sam_config()
+
         # 保存LLM配置
         self.save_llm_config()
         
         # 调用accept保存设置
         self.accept()
+    
+    def download_sam_model(self, sam_type: str, model_file: str):
+        """下载SAM模型"""
+        try:
+            from PyQt6.QtWidgets import QProgressDialog
+            from PyQt6.QtCore import Qt, QThread, pyqtSignal
+            
+            class ModelDownloadWorker(QThread):
+                """模型下载工作线程"""
+                download_finished = pyqtSignal(bool, str)
+                
+                def __init__(self, sam_type, model_file):
+                    super().__init__()
+                    self.sam_type = sam_type
+                    self.model_file = model_file
+                
+                def run(self):
+                    try:
+                        # 根据类型导入正确的类来触发下载
+                        if self.sam_type == "FastSAM":
+                            from ultralytics import FastSAM
+                            model = FastSAM(self.model_file)
+                        else:
+                            # SAM, SAM2, MobileSAM 都使用SAM类
+                            from ultralytics import SAM
+                            model = SAM(self.model_file)
+                        
+                        self.download_finished.emit(True, f"模型 {self.model_file} 下载成功")
+                    except Exception as e:
+                        self.download_finished.emit(False, f"下载失败: {str(e)}")
+            
+            # 显示进度对话框
+            progress = QProgressDialog(f"正在下载模型 {model_file}...", "取消", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setCancelButton(None)
+            progress.show()
+            
+            # 创建下载线程
+            self.download_worker = ModelDownloadWorker(sam_type, model_file)
+            self.download_worker.download_finished.connect(
+                lambda success, msg: self.on_model_download_finished(success, msg, progress)
+            )
+            self.download_worker.start()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"启动下载失败: {str(e)}")
+    
+    def on_model_download_finished(self, success: bool, message: str, progress_dialog):
+        """模型下载完成回调"""
+        progress_dialog.close()
+        
+        if success:
+            QMessageBox.information(self, "成功", message)
+        else:
+            QMessageBox.critical(self, "下载失败", message)
     
     def get_model_task(self) -> str:
         """获取当前选择的任务类型"""
@@ -881,6 +992,72 @@ class AutoLabelDialog(QDialog):
             'iou': self.sb_sam_iou.value(),
             'retina_masks': self.chk_sam_retina.isChecked()
         }
+
+    def load_sam_config(self):
+        """从配置文件加载SAM配置并应用到UI。"""
+        config = DEFAULT_SAM_CONFIG.copy()
+        if os.path.exists(SAM_CONFIG_FILE):
+            try:
+                with open(SAM_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                    if isinstance(saved, dict):
+                        config.update(saved)
+            except Exception:
+                pass
+
+        sam_type = config.get("sam_type", "SAM")
+        if sam_type in SAM_MODELS:
+            self.cb_sam_type.setCurrentText(sam_type)
+        else:
+            sam_type = self.cb_sam_type.currentText()
+
+        model_file = config.get("model_file", "sam_b.pt")
+        model_index = self.cb_sam_model.findData(model_file)
+        if model_index >= 0:
+            self.cb_sam_model.setCurrentIndex(model_index)
+
+        device = str(config.get("device", "cpu"))
+        if device == "cpu":
+            display_device = "CPU"
+        elif device.isdigit():
+            display_device = f"CUDA:{device}"
+        else:
+            display_device = "自动选择"
+        device_index = self.cb_sam_device.findText(display_device)
+        if device_index >= 0:
+            self.cb_sam_device.setCurrentIndex(device_index)
+
+        self.sb_sam_imgsz.setValue(float(config.get("imgsz", 1024)))
+        self.sb_sam_conf.setValue(float(config.get("conf", 0.4)))
+        self.sb_sam_iou.setValue(float(config.get("iou", 0.9)))
+        self.chk_sam_retina.setChecked(bool(config.get("retina_masks", True)))
+
+    def save_sam_config(self) -> bool:
+        """保存SAM配置到配置文件。"""
+        config = self.get_sam_config()
+        config_dir = os.path.dirname(SAM_CONFIG_FILE)
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir)
+        try:
+            with open(SAM_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def get_saved_sam_config(cls) -> dict:
+        """读取已保存的SAM配置（不依赖弹窗实例）。"""
+        config = DEFAULT_SAM_CONFIG.copy()
+        if os.path.exists(SAM_CONFIG_FILE):
+            try:
+                with open(SAM_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                    if isinstance(saved, dict):
+                        config.update(saved)
+            except Exception:
+                pass
+        return config
     
     # ==================== LLM相关方法 ====================
     
