@@ -62,11 +62,33 @@ class InferenceThread(QThread):
             
             # 加载模型
             self.log_message.emit(f"加载模型: {self.model_path}")
+            
+            # 检测模型类型
+            model_type = "PyTorch"
+            if self.model_path.endswith('.onnx'):
+                model_type = "ONNX"
+            elif self.model_path.endswith('.engine') or self.model_path.endswith('.trt'):
+                model_type = "TensorRT"
+            self.log_message.emit(f"模型类型: {model_type}")
+            
             try:
-                self.model = YOLO(self.model_path)
+                # 获取任务类型，用于ONNX/TensorRT模型
+                task = self.config.get('task', 'detect')
+                
+                # 对于ONNX和TensorRT模型，需要传入task参数
+                if model_type in ["ONNX", "TensorRT"]:
+                    self.log_message.emit(f"使用任务类型: {task}")
+                    self.model = YOLO(self.model_path, task=task)
+                else:
+                    self.model = YOLO(self.model_path)
                 self.log_message.emit("✓ 模型加载成功")
             except Exception as e:
                 self.log_message.emit(f"✗ 模型加载失败: {e}")
+                # 针对不同模型类型给出更详细的错误提示
+                if model_type == "ONNX":
+                    self.log_message.emit("提示: ONNX模型需要安装onnxruntime (pip install onnxruntime)")
+                elif model_type == "TensorRT":
+                    self.log_message.emit("提示: TensorRT模型需要安装tensorrt并配置CUDA环境")
                 self.inference_finished.emit(False, f"模型加载失败: {e}")
                 return
             
@@ -82,9 +104,12 @@ class InferenceThread(QThread):
             conf = self.config.get('conf', 0.25)
             iou = self.config.get('iou', 0.45)
             imgsz = self.config.get('imgsz', 640)
-            device = self.config.get('device', 'auto')
+            device = self.config.get('device', 'cpu')
             
-            if device == '自动选择':
+            # 标准化设备值
+            device = str(device).lower().strip()
+            
+            if device in ['自动选择', 'auto', '']:
                 import torch
                 # 更健壮的CUDA检测
                 try:
@@ -99,10 +124,19 @@ class InferenceThread(QThread):
                 except Exception as cuda_e:
                     device = 'cpu'
                     self.log_message.emit(f"⚠ CUDA检测失败，使用CPU: {cuda_e}")
-            elif device == 'CPU':
+            elif device in ['cpu', 'CPU']:
                 device = 'cpu'
-            elif device.startswith('CUDA:'):
+                self.log_message.emit("✓ 使用CPU进行推理")
+            elif device.startswith('cuda:') or device.startswith('CUDA:'):
                 device = device.split(':')[1]
+            elif device.isdigit():
+                # 纯数字，认为是GPU ID
+                device = device
+                self.log_message.emit(f"✓ 使用CUDA:{device}")
+            else:
+                # 默认使用CPU
+                device = 'cpu'
+                self.log_message.emit(f"⚠ 未知设备设置 '{device}'，默认使用CPU")
             
             self.log_message.emit(f"推理参数: conf={conf}, iou={iou}, imgsz={imgsz}, device={device}")
             
@@ -278,6 +312,7 @@ class InferenceThread(QThread):
             'source_path': source_path,
             'filename': os.path.basename(source_path),
             'detections': [],
+            'masks': [],  # 添加masks字段用于分割模型
             'speed': {},
             'annotated_image_path': None
         }
@@ -298,11 +333,36 @@ class InferenceThread(QThread):
                 }
                 result_data['detections'].append(detection)
         
+        # 获取分割masks（分割模型）
+        if hasattr(result, 'masks') and result.masks is not None:
+            masks = result.masks
+            if hasattr(masks, 'xy') and masks.xy is not None:
+                for i, mask_xy in enumerate(masks.xy):
+                    # mask_xy 是多边形点列表 [(x1,y1), (x2,y2), ...]
+                    if len(mask_xy) > 0:
+                        # 获取对应的类别信息
+                        class_id = 0
+                        class_name = 'unknown'
+                        confidence = 0.0
+                        if hasattr(result, 'boxes') and result.boxes is not None and i < len(result.boxes):
+                            box = result.boxes[i]
+                            class_id = int(box.cls.item()) if hasattr(box.cls, 'item') else int(box.cls)
+                            class_name = result.names.get(class_id, 'unknown')
+                            confidence = float(box.conf.item()) if hasattr(box.conf, 'item') else float(box.conf)
+                        
+                        mask_data = {
+                            'class_id': self.class_mapping.get(class_id, class_id),
+                            'class_name': class_name,
+                            'confidence': confidence,
+                            'points': mask_xy.tolist() if hasattr(mask_xy, 'tolist') else list(mask_xy)
+                        }
+                        result_data['masks'].append(mask_data)
+        
         # 获取推理速度
         if hasattr(result, 'speed'):
             result_data['speed'] = result.speed
         
-        # 获取标注后的图像
+        # 获取标注后的图像（Ultralytics会自动处理分割可视化）
         if hasattr(result, 'plot'):
             annotated_img = result.plot()
             if annotated_img is not None:
@@ -1408,13 +1468,23 @@ class TestPage(QWidget):
         """选择模型文件"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择模型文件", "",
-            "PyTorch模型 (*.pt *.pth);;所有文件 (*.*)"
+            "所有模型文件 (*.pt *.pth *.onnx *.engine *.trt);;"
+            "PyTorch模型 (*.pt *.pth);;"
+            "ONNX模型 (*.onnx);;"
+            "TensorRT模型 (*.engine *.trt);;"
+            "所有文件 (*.*)"
         )
         
         if file_path:
             self.model_path = file_path
             self.model_path_label.setText(f"模型: {file_path}")
             self.log_message(f"已选择模型: {file_path}")
+            
+            # 根据模型类型给出提示
+            if file_path.endswith('.onnx'):
+                self.log_message("ℹ 已选择ONNX模型，确保已安装onnxruntime或onnxruntime-gpu")
+            elif file_path.endswith('.engine') or file_path.endswith('.trt'):
+                self.log_message("ℹ 已选择TensorRT模型，确保已安装tensorrt并配置正确")
     
     def load_data(self, data_type: str):
         """加载数据"""
@@ -1488,12 +1558,16 @@ class TestPage(QWidget):
             classes_json = self.current_project.get('classes', '[]') if isinstance(self.current_project, dict) else '[]'
             project_classes = json.loads(classes_json) if classes_json else []
         
+        # 获取任务类型
+        task = self.task_type.currentData()
+        
         # 收集配置
         config = {
             'conf': self.conf_threshold.value(),
             'iou': self.iou_threshold.value(),
             'imgsz': self.inference_size.value(),
             'device': self.inference_device.currentText(),
+            'task': task,  # 添加任务类型到配置
         }
         
         # 确定模型路径
@@ -1502,7 +1576,6 @@ class TestPage(QWidget):
             # 使用预训练模型
             version = self.model_version.currentText()
             model_size = self.model_size.currentData()
-            task = self.task_type.currentData()
             
             if version and model_size:
                 model_prefix = ULTRALYTICS_MODELS[version]['prefix']
@@ -1653,14 +1726,25 @@ class TestPage(QWidget):
             info_text += f"<b>总帧数:</b> {result.get('total_frames', 0)}<br>"
             info_text += f"<b>已处理:</b> {result.get('processed_frames', 0)} 帧<br>"
         else:
+            # 显示检测框信息
             info_text += f"<b>检测到:</b> {len(result['detections'])} 个目标<br>"
             
             if result['detections']:
-                info_text += "<b>详情:</b><br>"
+                info_text += "<b>检测详情:</b><br>"
                 for i, det in enumerate(result['detections'][:10]):  # 最多显示10个
                     info_text += f"  {i+1}. {det['class_name']} ({det['confidence']:.2f})<br>"
                 if len(result['detections']) > 10:
                     info_text += f"  ... 还有 {len(result['detections']) - 10} 个目标<br>"
+            
+            # 显示分割mask信息（如果有）
+            if result.get('masks') and len(result['masks']) > 0:
+                info_text += f"<br><b>分割区域:</b> {len(result['masks'])} 个<br>"
+                info_text += "<b>分割详情:</b><br>"
+                for i, mask in enumerate(result['masks'][:10]):  # 最多显示10个
+                    point_count = len(mask.get('points', []))
+                    info_text += f"  {i+1}. {mask['class_name']} ({mask['confidence']:.2f}) - {point_count} 个点<br>"
+                if len(result['masks']) > 10:
+                    info_text += f"  ... 还有 {len(result['masks']) - 10} 个分割区域<br>"
         
         if result.get('speed'):
             speed = result['speed']

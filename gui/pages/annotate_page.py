@@ -27,10 +27,198 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import os
+import gc
+import threading
 
 from gui.styles import COLORS
 from models.database import db
 from gui.widgets.loading_dialog import LoadingOverlay
+
+SAM3_DOWNLOAD_URL = "https://huggingface.co/1038lab/sam3/discussions/1"
+
+
+class SAMModelManager:
+    """SAM模型缓存管理器：同配置复用，切换配置自动释放重载。"""
+
+    _instance = None
+    _instance_lock = threading.Lock()
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._model = None
+        self._model_key = None
+
+    @classmethod
+    def instance(cls):
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def get_model(self, sam_type: str, model_path: str, device: str):
+        """获取可复用模型；配置变化时释放旧模型并重载。"""
+        model_key = (sam_type, model_path, str(device))
+        with self._lock:
+            if self._model is not None and self._model_key == model_key:
+                return self._model
+
+            self._release_model_locked()
+
+            if sam_type == "FastSAM":
+                from ultralytics import FastSAM
+                self._model = FastSAM(model_path)
+            else:
+                # SAM/SAM2/MobileSAM/SAM3 均使用 SAM 类
+                from ultralytics import SAM
+                self._model = SAM(model_path)
+
+            self._model_key = model_key
+            return self._model
+
+    def release_model(self):
+        """主动释放当前缓存模型。"""
+        with self._lock:
+            self._release_model_locked()
+
+    def _release_model_locked(self):
+        if self._model is not None:
+            try:
+                del self._model
+            except Exception:
+                pass
+            self._model = None
+            self._model_key = None
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+
+class SAMMemoryPredictorManager:
+    """SAM2/SAM3 记忆预测器管理：按配置复用，切换配置释放。"""
+
+    _instance = None
+    _instance_lock = threading.Lock()
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._predictor = None
+        self._predictor_key = None
+
+    @classmethod
+    def instance(cls):
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def get_predictor(self, sam_config: dict):
+        sam_type = sam_config.get("sam_type", "SAM")
+        model_file = sam_config.get("model_file", "sam2_t.pt")
+        device = sam_config.get("device", "cpu")
+        imgsz = int(sam_config.get("imgsz", 1024))
+        # 动态记忆分割对阈值更敏感，使用较低conf避免把有效mask过滤空
+        conf = 0.01
+        model_key = (sam_type, model_file, str(device), imgsz)
+
+        with self._lock:
+            if self._predictor is not None and self._predictor_key == model_key:
+                return self._predictor
+
+            self._release_locked()
+
+            from ultralytics.models.sam import SAM2DynamicInteractivePredictor
+            overrides = dict(
+                conf=conf,
+                task="segment",
+                mode="predict",
+                imgsz=imgsz,
+                model=model_file,
+                save=False,
+                device=device,
+                verbose=False,
+            )
+            self._predictor = SAM2DynamicInteractivePredictor(overrides=overrides, max_obj_num=20)
+            self._predictor_key = model_key
+            return self._predictor
+
+    def clear(self):
+        with self._lock:
+            self._release_locked()
+
+    def _release_locked(self):
+        if self._predictor is not None:
+            try:
+                del self._predictor
+            except Exception:
+                pass
+            self._predictor = None
+            self._predictor_key = None
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+
+class SAMMemoryObjectsDialog(QDialog):
+    """记忆标注对象管理弹窗（可在画布上交互后添加对象）。"""
+
+    add_requested = pyqtSignal()
+    delete_requested = pyqtSignal(int)
+    save_requested = pyqtSignal()
+    closed = pyqtSignal()  # 窗口关闭信号
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("SAM记忆对象管理")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        self.info_label = QLabel("请在图片上用SAM提示（点/框）后点击“添加对象”。")
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        self.count_label = QLabel("当前对象数: 0")
+        layout.addWidget(self.count_label)
+
+        self.obj_list = QListWidget()
+        layout.addWidget(self.obj_list)
+
+        row = QHBoxLayout()
+        self.btn_add = QPushButton("添加对象")
+        self.btn_del = QPushButton("删除对象")
+        self.btn_save = QPushButton("保存并更新记忆")
+        row.addWidget(self.btn_add)
+        row.addWidget(self.btn_del)
+        row.addWidget(self.btn_save)
+        layout.addLayout(row)
+
+        self.btn_add.clicked.connect(self.add_requested.emit)
+        self.btn_del.clicked.connect(self._on_delete_clicked)
+        self.btn_save.clicked.connect(self.save_requested.emit)
+
+    def closeEvent(self, event):
+        """窗口关闭时发送信号"""
+        self.closed.emit()
+        super().closeEvent(event)
+
+    def _on_delete_clicked(self):
+        row = self.obj_list.currentRow()
+        if row >= 0:
+            self.delete_requested.emit(row)
+
+    def update_objects(self, objects: list):
+        self.obj_list.clear()
+        for obj in objects:
+            desc = f"ID={obj.get('obj_id')}  点={len(obj.get('points', []))}  框={len(obj.get('bboxes', []))}"
+            self.obj_list.addItem(desc)
+        self.count_label.setText(f"当前对象数: {len(objects)}")
 
 
 class SAMInferenceWorker(QThread):
@@ -61,6 +249,7 @@ class SAMInferenceWorker(QThread):
         try:
             sam_type = self.sam_config.get('sam_type', 'SAM')
             model_file = self.sam_config.get('model_file', 'sam_b.pt')
+            device = self.sam_config.get('device', 'cpu')
             
             # 检查模型文件是否存在
             import os
@@ -77,17 +266,21 @@ class SAMInferenceWorker(QThread):
                     break
             
             if model_path is None:
-                self.inference_finished.emit(False, f"模型文件不存在: {model_file}\n请下载模型后重试", None)
+                if sam_type == "SAM3":
+                    self.inference_finished.emit(
+                        False,
+                        "SAM3模型未找到: sam3.pt\n"
+                        "SAM3不支持自动下载。\n"
+                        "请到以下页面下载 sam3.pt 后放到项目根目录：\n"
+                        f"{SAM3_DOWNLOAD_URL}",
+                        None
+                    )
+                else:
+                    self.inference_finished.emit(False, f"模型文件不存在: {model_file}\n请下载模型后重试", None)
                 return
             
-            # 导入模型 - 根据类型使用正确的类
-            if sam_type == "FastSAM":
-                from ultralytics import FastSAM
-                model = FastSAM(model_path)
-            else:
-                # SAM, SAM2, MobileSAM 都使用SAM类
-                from ultralytics import SAM
-                model = SAM(model_path)
+            # 模型缓存复用：同配置仅加载一次，切换配置时自动释放重载
+            model = SAMModelManager.instance().get_model(sam_type, model_path, device)
 
             predict_kwargs = self._build_predict_kwargs()
             if sam_type == "FastSAM":
@@ -125,7 +318,18 @@ class SAMInferenceWorker(QThread):
                 self.inference_finished.emit(False, "推理无结果", None)
                 
         except Exception as e:
-            self.inference_finished.emit(False, f"推理出错: {str(e)}", None)
+            sam_type = self.sam_config.get('sam_type', 'SAM')
+            if sam_type == "SAM3":
+                self.inference_finished.emit(
+                    False,
+                    "SAM3加载/推理失败。\n"
+                    "请确认 sam3.pt 已放在项目根目录且文件可用。\n"
+                    f"下载说明: {SAM3_DOWNLOAD_URL}\n"
+                    f"错误详情: {str(e)}",
+                    None
+                )
+            else:
+                self.inference_finished.emit(False, f"推理出错: {str(e)}", None)
 
 
 class AnnotateImageLoadWorker(QThread):
@@ -261,6 +465,11 @@ class AnnotationCanvas(QFrame):
         self.sam_drawing_bbox = False
         self.sam_start_point = None
         self.sam_current_point = None
+        # SAM运行模式：normal=普通交互(允许自动推理), memory_collect=记忆采集(禁止自动推理)
+        self.sam_operation_mode = "normal"
+        # SAM记忆模式显示列表
+        self.memory_display_points = []  # [{"x": x, "y": y, "obj_id": id}, ...]
+        self.memory_display_bboxes = []  # [{"x1": x1, "y1": y1, "x2": x2, "y2": y2, "obj_id": id}, ...]
         
         self.init_ui()
     
@@ -345,8 +554,17 @@ class AnnotationCanvas(QFrame):
             self.sam_mode = 'point'
         else:
             self.sam_mode_active = False
+            self.sam_operation_mode = "normal"
         
         self.update()
+
+    def set_sam_operation_mode(self, mode: str):
+        """设置SAM交互模式。"""
+        self.sam_operation_mode = mode if mode in ("normal", "memory_collect") else "normal"
+
+    def _sam_auto_infer_enabled(self) -> bool:
+        """当前状态下是否允许SAM自动推理。"""
+        return self.sam_mode_active and self.sam_operation_mode == "normal"
     
     def image_to_widget(self, x: float, y: float) -> QPoint:
         """图像坐标转换为控件坐标"""
@@ -413,7 +631,86 @@ class AnnotationCanvas(QFrame):
     
     def draw_sam_elements(self, painter: QPainter):
         """绘制SAM模式的点和框"""
-        # 绘制已添加的点
+        # 绘制记忆对象的所有标记（不同ID用不同颜色）
+        memory_points = getattr(self, 'memory_display_points', [])
+        memory_bboxes = getattr(self, 'memory_display_bboxes', [])
+        
+        if memory_points:
+            # 为不同ID分配不同颜色
+            id_colors = {}
+            color_list = [
+                QColor(255, 0, 0),    # 红
+                QColor(0, 255, 0),    # 绿
+                QColor(0, 0, 255),    # 蓝
+                QColor(255, 255, 0),  # 黄
+                QColor(255, 0, 255),  # 紫
+                QColor(0, 255, 255),  # 青
+                QColor(255, 128, 0),  # 橙
+                QColor(128, 0, 255),  # 紫红
+            ]
+            
+            for point_data in memory_points:
+                obj_id = point_data.get("obj_id", 0)
+                if obj_id not in id_colors:
+                    id_colors[obj_id] = color_list[obj_id % len(color_list)]
+                color = id_colors[obj_id]
+                
+                img_x = point_data["x"]
+                img_y = point_data["y"]
+                widget_pos = self.image_to_widget(img_x, img_y)
+                
+                # 绘制点
+                painter.setPen(QPen(color, 2))
+                painter.setBrush(QBrush(color))
+                radius = 8
+                painter.drawEllipse(widget_pos, radius, radius)
+                
+                # 绘制ID
+                painter.setPen(QColor(255, 255, 255))
+                painter.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+                painter.drawText(widget_pos.x() + radius + 2, widget_pos.y() - radius, f"ID:{obj_id}")
+        
+        # 绘制记忆对象的所有框
+        if memory_bboxes:
+            id_colors = {}
+            color_list = [
+                QColor(255, 0, 0), QColor(0, 255, 0), QColor(0, 0, 255),
+                QColor(255, 255, 0), QColor(255, 0, 255), QColor(0, 255, 255),
+                QColor(255, 128, 0), QColor(128, 0, 255),
+            ]
+            
+            for bbox_data in memory_bboxes:
+                obj_id = bbox_data.get("obj_id", 0)
+                if obj_id not in id_colors:
+                    id_colors[obj_id] = color_list[obj_id % len(color_list)]
+                color = id_colors[obj_id]
+                
+                x1 = bbox_data["x1"]
+                y1 = bbox_data["y1"]
+                x2 = bbox_data["x2"]
+                y2 = bbox_data["y2"]
+                
+                p1 = self.image_to_widget(x1, y1)
+                p2 = self.image_to_widget(x2, y2)
+                
+                # 绘制框
+                pen = QPen(color, 2)
+                pen.setStyle(Qt.PenStyle.SolidLine)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                rect = QRect(p1, p2)
+                painter.drawRect(rect)
+                
+                # 绘制ID标签
+                painter.setBrush(QBrush(color))
+                painter.setPen(QPen(color, 1))
+                label_rect = QRect(p1.x(), p1.y() - 20, 40, 20)
+                painter.drawRect(label_rect)
+                painter.setPen(QColor(255, 255, 255))
+                painter.setFont(QFont("Microsoft YaHei", 9))
+                painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, f"ID:{obj_id}")
+        
+        # 绘制当前正在添加的点（临时标记）
         painter.setPen(QPen(QColor(0, 255, 0), 2))
         painter.setBrush(QBrush(QColor(0, 255, 0)))
         for i, (img_x, img_y) in enumerate(self.sam_points):
@@ -837,8 +1134,9 @@ class AnnotationCanvas(QFrame):
                 
                 # 如果没有按住Ctrl，立即进行推理
                 if not is_ctrl_pressed:
-                    project_type = getattr(self, 'sam_project_type', 'segment')
-                    self.run_sam_inference(project_type)
+                    if self._sam_auto_infer_enabled():
+                        project_type = getattr(self, 'sam_project_type', 'segment')
+                        self.run_sam_inference(project_type)
                 return
             elif event.button() == Qt.MouseButton.RightButton:
                 # 右键开始画框
@@ -1108,8 +1406,9 @@ class AnnotationCanvas(QFrame):
                 self.sam_bboxes.append((x1, y1, x2, y2))
                 self.update()
                 # 运行推理
-                project_type = getattr(self, 'sam_project_type', 'segment')
-                self.run_sam_inference(project_type)
+                if self._sam_auto_infer_enabled():
+                    project_type = getattr(self, 'sam_project_type', 'segment')
+                    self.run_sam_inference(project_type)
                 return
         
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1628,6 +1927,9 @@ class AnnotationCanvas(QFrame):
     
     def run_sam_inference(self, project_type: str = 'segment'):
         """运行SAM推理"""
+        if not self._sam_auto_infer_enabled():
+            # 非normal模式下禁止自动推理
+            return
         if not self.sam_config or not self.sam_image_path:
             return
         
@@ -1651,6 +1953,12 @@ class AnnotationCanvas(QFrame):
     
     def on_sam_inference_finished(self, success: bool, message: str, masks, project_type: str = 'segment'):
         """SAM推理完成回调"""
+        if self.sam_operation_mode != "normal":
+            # 记忆采集阶段丢弃任何异步返回，避免误落标注
+            self.sam_points = []
+            self.sam_bboxes = []
+            self.update()
+            return
 
         mask_array = masks
         mask_scores = None
@@ -1857,6 +2165,8 @@ class AnnotatePage(QWidget):
         self.auto_label_dialog = None
         self.model_manager = None
         self.batch_labeling_manager = None
+        self.sam_memory_objects = []
+        self.sam_memory_dialog = None
         
         self.init_ui()
     
@@ -2090,7 +2400,6 @@ class AnnotatePage(QWidget):
         toolbar.addSeparator()
         self.btn_sam = QPushButton("🎯 SAM")
         self.btn_sam.setToolTip("使用SAM进行交互式分割标注")
-        self.btn_sam.clicked.connect(self.start_sam_annotation)
         sam_btn_style = (
             f"QPushButton {{"
             f"    background-color: {COLORS['success']};"
@@ -2103,9 +2412,16 @@ class AnnotatePage(QWidget):
             f"QPushButton:hover {{"
             f"    background-color: {COLORS['success']};"
             f"}}"
+            f"QPushButton::menu-indicator {{"
+            f"    image: none;"
+            f"}}"
+            f"QPushButton::menu-indicator::hover {{"
+            f"    image: none;"
+            f"}}"
         )
         self.btn_sam.setStyleSheet(sam_btn_style)
         toolbar.addWidget(self.btn_sam)
+        self.apply_sam_button_mode()
         
         # LLM自动标注按钮
         toolbar.addSeparator()
@@ -2154,6 +2470,46 @@ class AnnotatePage(QWidget):
         toolbar.addWidget(self.btn_batch_process)
         
         return toolbar
+
+    def apply_sam_button_mode(self):
+        """根据SAM设置刷新按钮行为：普通模式/记忆模式。"""
+        if not hasattr(self, "btn_sam"):
+            return
+        try:
+            self.btn_sam.clicked.disconnect()
+        except Exception:
+            pass
+        self.btn_sam.setMenu(None)
+
+        sam_config = AutoLabelDialog.get_saved_sam_config()
+        sam_type = sam_config.get("sam_type", "SAM")
+        usage_mode = sam_config.get("usage_mode", "normal")
+
+        if usage_mode == "memory" and sam_type in ("SAM2", "SAM3"):
+            self.btn_sam.setText("🎯 SAM记忆")
+            self.btn_sam.setToolTip("SAM记忆标注：更新记忆/清空记忆/单张推理/批量推理")
+            self.btn_sam.setMenu(self.create_sam_memory_menu())
+        else:
+            self.btn_sam.setText("🎯 SAM")
+            self.btn_sam.setToolTip("使用SAM进行交互式分割标注")
+            self.btn_sam.clicked.connect(self.start_sam_annotation)
+
+    def create_sam_memory_menu(self) -> QMenu:
+        menu = QMenu(self)
+        act_update = QAction("更新记忆", self)
+        act_clear = QAction("清空记忆", self)
+        act_single = QAction("单张推理", self)
+        act_batch = QAction("批量推理", self)
+        act_update.triggered.connect(self.start_sam_memory_update)
+        act_clear.triggered.connect(self.clear_sam_memory)
+        act_single.triggered.connect(self.run_sam_memory_single)
+        act_batch.triggered.connect(self.run_sam_memory_batch)
+        menu.addAction(act_update)
+        menu.addAction(act_clear)
+        menu.addSeparator()
+        menu.addAction(act_single)
+        menu.addAction(act_batch)
+        return menu
     
     def create_right_panel(self) -> QWidget:
         """创建右侧面板 - 属性面板"""
@@ -2646,11 +3002,7 @@ Esc - 取消操作
             }
             
             # 输出调试信息
-            print("=" * 50)
-            print("标注页面保存自动标注设置:")
-            print(f"  模型路径: {self.auto_label_settings['model_path']}")
-            print(f"  任务类型: {self.auto_label_settings['model_task']}")
-            print("=" * 50)
+
             
             # 更新标注页面的类别列表
             if hasattr(self.auto_label_dialog, 'project_classes'):
@@ -2662,6 +3014,7 @@ Esc - 取消操作
                     # 更新界面
                     self.update_class_list()
                     QMessageBox.information(self, "成功", "类别列表已更新")
+            self.apply_sam_button_mode()
     
     def start_sam_annotation(self):
         """开始SAM交互式标注"""
@@ -2702,6 +3055,7 @@ Esc - 取消操作
         
         # 进入SAM标注模式
         self.canvas.set_tool('sam')
+        self.canvas.set_sam_operation_mode("normal")
         self.canvas.sam_config = sam_config
         self.canvas.sam_image_path = image_path
         self.canvas.sam_project_type = project_type
@@ -2718,6 +3072,444 @@ Esc - 取消操作
             "• 右键拖拽: 绘制框提示\n"
             "• 松开鼠标: 自动推理\n"
             "• 按ESC键: 退出SAM模式")
+
+    def _get_current_image_path(self) -> str:
+        if not self.current_image_id:
+            return ""
+        for img in self.images:
+            if img['id'] == self.current_image_id:
+                return img.get('storage_path', '')
+        return ""
+
+    def _prepare_memory_mode_context(self):
+        if not self.current_project_id:
+            QMessageBox.warning(self, "提示", "请先选择一个项目")
+            return None, None
+        image_path = self._get_current_image_path()
+        if not image_path or not os.path.exists(image_path):
+            QMessageBox.warning(self, "提示", "请先选择有效图片")
+            return None, None
+        sam_config = AutoLabelDialog.get_saved_sam_config()
+        if sam_config.get("usage_mode") != "memory" or sam_config.get("sam_type") not in ("SAM2", "SAM3"):
+            QMessageBox.warning(self, "提示", "当前SAM设置不是记忆标注模式（仅SAM2/SAM3支持）")
+            return None, None
+        return sam_config, image_path
+
+    def start_sam_memory_update(self):
+        """打开记忆对象管理并允许在画布上输入对象提示。"""
+        sam_config, image_path = self._prepare_memory_mode_context()
+        if not sam_config:
+            return
+
+        project = db.get_project(self.current_project_id)
+        project_type = project.get('type', 'detect') if isinstance(project, dict) else 'detect'
+
+        self.canvas.set_tool('sam')
+        self.canvas.set_sam_operation_mode("memory_collect")
+        # 清理进入记忆模式前残留的提示与异步回调影响
+        self.canvas.sam_points = []
+        self.canvas.sam_bboxes = []
+        self.canvas.sam_config = sam_config
+        self.canvas.sam_image_path = image_path
+        self.canvas.sam_project_type = project_type
+
+        if self.sam_memory_dialog is None:
+            self.sam_memory_dialog = SAMMemoryObjectsDialog(self)
+            self.sam_memory_dialog.add_requested.connect(self.add_sam_memory_object_from_canvas)
+            self.sam_memory_dialog.delete_requested.connect(self.delete_sam_memory_object)
+            self.sam_memory_dialog.save_requested.connect(self.save_sam_memory_and_infer_current)
+            self.sam_memory_dialog.closed.connect(self.on_sam_memory_dialog_closed)
+        self.sam_memory_dialog.update_objects(self.sam_memory_objects)
+        self.sam_memory_dialog.show()
+        self.sam_memory_dialog.raise_()
+        # 清空画布上的临时标记，并显示所有已有对象的标记
+        self.canvas.sam_points = []
+        self.canvas.sam_bboxes = []
+        self._draw_all_memory_objects_on_canvas()
+
+        QMessageBox.information(self, "记忆标注", "请在图片上添加点/框提示后点击“添加对象“，\n可以指定ID来更新已有对象。")
+
+    def add_sam_memory_object_from_canvas(self):
+        print(f"[SAM Memory] 添加对象被调用")
+        points = list(self.canvas.sam_points)
+        bboxes = list(self.canvas.sam_bboxes)
+        print(f"[SAM Memory] 当前画布标记: points={len(points)}, bboxes={len(bboxes)}")
+        
+        if not points and not bboxes:
+            QMessageBox.warning(self, "提示", "请先在图片上添加点或框提示")
+            return
+        
+        # 弹窗输入对象ID
+        from PyQt6.QtWidgets import QInputDialog
+        
+        # 获取建议的ID（已有ID的最大值+1）
+        suggested_id = 0
+        if self.sam_memory_objects:
+            suggested_id = max(x["obj_id"] for x in self.sam_memory_objects) + 1
+        
+        print(f"[SAM Memory] 建议ID: {suggested_id}")
+        
+        try:
+            obj_id, ok = QInputDialog.getInt(
+                self,
+                "添加记忆对象",
+                "请输入对象ID:",
+                value=suggested_id,
+                min=0,
+                max=999
+            )
+        except Exception as e:
+            print(f"[SAM Memory] 输入对话框出错: {e}")
+            return
+        
+        if not ok:
+            print(f"[SAM Memory] 用户取消输入")
+            return
+        
+        print(f"[SAM Memory] 用户输入ID: {obj_id}")
+        
+        # 检查是否已存在该ID，如果存在则更新
+        existing_idx = None
+        for i, obj in enumerate(self.sam_memory_objects):
+            if obj["obj_id"] == obj_id:
+                existing_idx = i
+                break
+        
+        if existing_idx is not None:
+            # 更新已有对象
+            reply = QMessageBox.question(
+                self,
+                "ID已存在",
+                f"ID {obj_id} 已存在，是否覆盖？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.sam_memory_objects[existing_idx] = {
+                    "obj_id": obj_id,
+                    "points": points,
+                    "bboxes": bboxes,
+                }
+                print(f"[SAM Memory] 更新已有对象 ID={obj_id}")
+        else:
+            # 添加新对象
+            self.sam_memory_objects.append({
+                "obj_id": obj_id,
+                "points": points,
+                "bboxes": bboxes,
+            })
+            print(f"[SAM Memory] 添加新对象 ID={obj_id}")
+        
+        # 清空画布上的临时标记
+        self.canvas.sam_points = []
+        self.canvas.sam_bboxes = []
+        self.canvas.update()
+        
+        # 更新对话框列表
+        if self.sam_memory_dialog:
+            self.sam_memory_dialog.update_objects(self.sam_memory_objects)
+        
+        # 在图上显示所有对象的标记
+        print(f"[SAM Memory] 开始绘制所有对象标记")
+        self._draw_all_memory_objects_on_canvas()
+        print(f"[SAM Memory] 绘制完成")
+
+    def delete_sam_memory_object(self, index: int):
+        if 0 <= index < len(self.sam_memory_objects):
+            del self.sam_memory_objects[index]
+            if self.sam_memory_dialog:
+                self.sam_memory_dialog.update_objects(self.sam_memory_objects)
+            # 重新绘制所有对象标记
+            self._draw_all_memory_objects_on_canvas()
+    
+    def _draw_all_memory_objects_on_canvas(self):
+        """在画布上绘制所有记忆对象的标记"""
+        print(f"[SAM Memory] _draw_all_memory_objects_on_canvas 被调用")
+        
+        # 清空当前临时标记
+        self.canvas.sam_points = []
+        self.canvas.sam_bboxes = []
+        
+        # 收集所有对象的标记用于显示
+        all_points = []
+        all_bboxes = []
+        
+        print(f"[SAM Memory] 当前记忆对象数: {len(self.sam_memory_objects)}")
+        
+        for obj in self.sam_memory_objects:
+            obj_id = obj.get("obj_id", 0)
+            points = obj.get("points", [])
+            bboxes = obj.get("bboxes", [])
+            
+            print(f"[SAM Memory] 对象 ID={obj_id}: points={len(points)}, bboxes={len(bboxes)}")
+            
+            # 为每个点添加ID信息
+            for p in points:
+                all_points.append({
+                    "x": p[0],
+                    "y": p[1],
+                    "obj_id": obj_id
+                })
+            
+            # 为每个框添加ID信息
+            for bbox in bboxes:
+                all_bboxes.append({
+                    "x1": bbox[0],
+                    "y1": bbox[1],
+                    "x2": bbox[2],
+                    "y2": bbox[3],
+                    "obj_id": obj_id
+                })
+        
+        print(f"[SAM Memory] 总显示点数: {len(all_points)}, 总显示框数: {len(all_bboxes)}")
+        
+        # 保存到画布的显示列表
+        self.canvas.memory_display_points = all_points
+        self.canvas.memory_display_bboxes = all_bboxes
+        self.canvas.update()
+        print(f"[SAM Memory] 画布更新完成")
+
+    def on_sam_memory_dialog_closed(self):
+        """记忆对象管理对话框关闭时的处理"""
+        print(f"[SAM Memory] 对话框关闭，清除画布上的记忆标记")
+        # 清除画布上的记忆标记显示
+        self.canvas.memory_display_points = []
+        self.canvas.memory_display_bboxes = []
+        # 清空临时标记
+        self.canvas.sam_points = []
+        self.canvas.sam_bboxes = []
+        self.canvas.update()
+        # 退出SAM记忆采集模式
+        self.canvas.set_sam_operation_mode("normal")
+        self.canvas.sam_mode_active = False
+        self.canvas.set_tool('rectangle')
+        print(f"[SAM Memory] 已清除标记并退出SAM模式")
+
+    def clear_sam_memory(self):
+        SAMMemoryPredictorManager.instance().clear()
+        self.sam_memory_objects = []
+        if self.sam_memory_dialog:
+            self.sam_memory_dialog.update_objects(self.sam_memory_objects)
+        QMessageBox.information(self, "提示", "SAM记忆已清空")
+
+    def _run_memory_predictor(self, sam_config: dict, image_path: str, update_objects: list = None):
+        predictor = SAMMemoryPredictorManager.instance().get_predictor(sam_config)
+        last_update_results = None
+        if update_objects:
+            for obj in update_objects:
+                kwargs = {
+                    "source": image_path,
+                    "obj_ids": [obj["obj_id"]],
+                    "update_memory": True,
+                }
+                if obj.get("bboxes"):
+                    kwargs["bboxes"] = [obj["bboxes"][-1]]
+                if obj.get("points"):
+                    kwargs["points"] = [[p[0], p[1]] for p in obj["points"]]
+                    kwargs["labels"] = [1] * len(obj["points"])
+                update_results = predictor(**kwargs)
+                if update_results:
+                    last_update_results = update_results
+        infer_results = predictor(source=image_path)
+        # 某些场景下“同图更新记忆后立刻推理同图”会返回空，回退到最近一次更新结果
+        if self._memory_results_empty(infer_results) and not self._memory_results_empty(last_update_results):
+            return last_update_results
+        return infer_results
+
+    @staticmethod
+    def _memory_results_empty(results) -> bool:
+        if not results or len(results) == 0:
+            return True
+        result = results[0]
+        if not hasattr(result, "masks") or result.masks is None or result.masks.data is None:
+            return True
+        try:
+            return len(result.masks.data) == 0
+        except Exception:
+            return False
+
+    def save_sam_memory_and_infer_current(self):
+        sam_config, image_path = self._prepare_memory_mode_context()
+        if not sam_config:
+            return
+        if not self.sam_memory_objects:
+            QMessageBox.warning(self, "提示", "请先添加至少一个记忆对象")
+            return
+        try:
+            self.canvas.set_sam_operation_mode("normal")
+            results = self._run_memory_predictor(sam_config, image_path, update_objects=self.sam_memory_objects)
+            ok, msg, ann_count = self._apply_memory_results_to_current_image(results)
+            if ok:
+                QMessageBox.information(
+                    self,
+                    "记忆推理完成",
+                    f"记忆对象数: {len(self.sam_memory_objects)}\n当前图新增标注: {ann_count}"
+                )
+            else:
+                QMessageBox.warning(self, "记忆推理无结果", msg)
+        except Exception as e:
+            QMessageBox.critical(self, "记忆推理失败", str(e))
+
+    def _apply_memory_results_to_current_image(self, results):
+        project = db.get_project(self.current_project_id)
+        project_type = project.get('type', 'detect') if isinstance(project, dict) else 'detect'
+        anns = self._build_annotations_from_memory_results(results, project_type)
+        if not anns:
+            summary = self._summarize_memory_results(results)
+            return False, f"模型返回了空结果（没有可用mask/轮廓）。\n结果摘要: {summary}\n请尝试补充提示点或框后重试。", 0
+        for ann in anns:
+            self.on_annotation_created(ann)
+        self.load_annotations()
+        return True, "ok", len(anns)
+
+    @staticmethod
+    def _summarize_memory_results(results) -> str:
+        if not results or len(results) == 0:
+            return "results=empty"
+        result = results[0]
+        if not hasattr(result, "masks") or result.masks is None or result.masks.data is None:
+            return "masks=None"
+        data = result.masks.data
+        try:
+            shape = tuple(data.shape)
+        except Exception:
+            shape = "unknown"
+        try:
+            count = len(data)
+        except Exception:
+            count = "unknown"
+        return f"masks.shape={shape}, count={count}"
+
+    def run_sam_memory_single(self):
+        sam_config, image_path = self._prepare_memory_mode_context()
+        if not sam_config:
+            return
+        project = db.get_project(self.current_project_id)
+        _ = project.get('type', 'detect') if isinstance(project, dict) else 'detect'
+        try:
+            self.canvas.set_sam_operation_mode("normal")
+            results = self._run_memory_predictor(sam_config, image_path)
+            ok, msg, ann_count = self._apply_memory_results_to_current_image(results)
+            if ok:
+                QMessageBox.information(self, "单张记忆推理完成", f"当前图新增标注: {ann_count}")
+            else:
+                QMessageBox.warning(self, "单张记忆推理无结果", msg)
+        except Exception as e:
+            QMessageBox.critical(self, "推理失败", str(e))
+
+    def run_sam_memory_batch(self):
+        sam_config, _ = self._prepare_memory_mode_context()
+        if not sam_config:
+            return
+        if not self.images:
+            QMessageBox.warning(self, "提示", "当前项目没有图片")
+            return
+        if not self.current_image_id:
+            QMessageBox.warning(self, "提示", "请先选择当前图片，批量推理将从该图片开始")
+            return
+        if not self.sam_memory_objects:
+            QMessageBox.warning(self, "提示", "请先执行“更新记忆”并保存至少一个对象")
+            return
+
+        start_idx = next((i for i, img in enumerate(self.images) if img.get("id") == self.current_image_id), -1)
+        if start_idx < 0:
+            QMessageBox.warning(self, "提示", "未找到当前图片在列表中的位置")
+            return
+        images_to_process = self.images[start_idx:]
+        if not images_to_process:
+            QMessageBox.warning(self, "提示", "当前图片之后没有可处理图片")
+            return
+
+        project = db.get_project(self.current_project_id)
+        project_type = project.get('type', 'detect') if isinstance(project, dict) else 'detect'
+        processed = 0
+        failed = 0
+        for img in images_to_process:
+            image_path = img.get("storage_path", "")
+            if not image_path or not os.path.exists(image_path):
+                failed += 1
+                continue
+            try:
+                results = self._run_memory_predictor(sam_config, image_path)
+                anns = self._build_annotations_from_memory_results(results, project_type)
+                for ann in anns:
+                    class_id = ann.get('class_id', self.current_class_id)
+                    class_name = self.classes[class_id]['name'] if class_id < len(self.classes) else 'unknown'
+                    db.add_annotation(
+                        image_id=img['id'],
+                        project_id=self.current_project_id,
+                        class_id=class_id,
+                        class_name=class_name,
+                        annotation_type=ann['type'],
+                        data=ann['data']
+                    )
+                if anns:
+                    db.update_image_status(img['id'], 'annotated')
+                processed += 1
+            except Exception:
+                failed += 1
+        self.load_annotations()
+        QMessageBox.information(
+            self,
+            "批量记忆推理",
+            f"处理范围: 从当前图片开始，共 {len(images_to_process)} 张\n完成: {processed} 张，失败: {failed} 张"
+        )
+
+    def _build_annotations_from_memory_results(self, results, project_type: str) -> list:
+        if not results or len(results) == 0:
+            return []
+        result = results[0]
+        if not hasattr(result, 'masks') or result.masks is None:
+            return []
+        masks = result.masks.data.cpu().numpy() if hasattr(result.masks.data, 'cpu') else result.masks.data
+        masks = np.asarray(masks)
+        if masks.ndim == 2:
+            mask_list = [masks]
+        elif masks.ndim == 3:
+            mask_list = [m for m in masks]
+        elif masks.ndim >= 4:
+            # 兼容 [N, K, H, W]，统一拉平为多个2D mask
+            h, w = masks.shape[-2], masks.shape[-1]
+            mask_list = [m for m in masks.reshape(-1, h, w)]
+        else:
+            return []
+        annotations = []
+        for mask in mask_list:
+            if mask.ndim > 2:
+                mask = mask.squeeze()
+            mask_uint8 = (mask > 0).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+            if project_type == 'detect':
+                all_x, all_y, all_x2, all_y2 = [], [], [], []
+                for contour in contours:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    all_x.append(x)
+                    all_y.append(y)
+                    all_x2.append(x + w)
+                    all_y2.append(y + h)
+                annotations.append({
+                    'type': 'bbox',
+                    'class_id': self.current_class_id,
+                    'data': {
+                        'x': float(min(all_x)),
+                        'y': float(min(all_y)),
+                        'width': float(max(all_x2) - min(all_x)),
+                        'height': float(max(all_y2) - min(all_y)),
+                    }
+                })
+            else:
+                largest_contour = max(contours, key=cv2.contourArea)
+                epsilon = 0.005 * cv2.arcLength(largest_contour, True)
+                approx_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
+                points = [{'x': float(p[0][0]), 'y': float(p[0][1])} for p in approx_contour]
+                if points:
+                    annotations.append({
+                        'type': 'polygon',
+                        'class_id': self.current_class_id,
+                        'data': {'points': points}
+                    })
+        return annotations
     
     def show_batch_process_dialog(self):
         """显示批量处理标注对话框"""

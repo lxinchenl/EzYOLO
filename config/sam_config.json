@@ -3,7 +3,8 @@
   "model_file": "sam2.1_b.pt",
   "device": "0",
   "imgsz": 1024,
-  "conf": 0.4,
+  "conf": 0.2,
   "iou": 0.9,
-  "retina_masks": true
+  "retina_masks": true,
+  "usage_mode": "normal"
 }

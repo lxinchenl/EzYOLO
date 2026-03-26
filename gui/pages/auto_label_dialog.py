@@ -21,6 +21,7 @@ from gui.styles import COLORS
 # LLM配置文件路径
 LLM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'llm_config.json')
 SAM_CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'sam_config.json')
+SAM3_DOWNLOAD_URL = "https://huggingface.co/1038lab/sam3/discussions/1"
 
 # 默认LLM配置
 DEFAULT_LLM_CONFIG = {
@@ -48,6 +49,7 @@ DEFAULT_SAM_CONFIG = {
     "conf": 0.4,
     "iou": 0.9,
     "retina_masks": True,
+    "usage_mode": "normal",
 }
 
 # 真实的Ultralytics模型配置（从train_page.py获取）
@@ -123,6 +125,11 @@ SAM_MODELS = {
         "models": {
             "FastSAM-s": "FastSAM-s.pt",
             "FastSAM-x": "FastSAM-x.pt"
+        }
+    },
+    "SAM3": {
+        "models": {
+            "SAM 3": "sam3.pt"
         }
     }
 }
@@ -280,6 +287,10 @@ class AutoLabelDialog(QDialog):
         # SAM推理参数组
         sam_params_group = self.create_sam_params_group()
         layout.addWidget(sam_params_group)
+
+        # SAM使用方式组
+        sam_usage_group = self.create_sam_usage_group()
+        layout.addWidget(sam_usage_group)
         
         layout.addStretch()
         return tab
@@ -733,17 +744,7 @@ class AutoLabelDialog(QDialog):
             model_name = os.path.basename(model_path) if model_path else "自定义模型"
         else:
             model_name = f"{model_version}-{model_size}-{model_task}" if model_version else model_path
-        
-        # 输出调试信息
-        print("=" * 50)
-        print("自动标注设置保存:")
-        print(f"  当前任务类型: {model_task}")
-        print(f"  模型名称: {model_name}")
-        print(f"  模型路径: {model_path}")
-        print(f"  模型版本: {model_version}")
-        print(f"  模型大小: {model_size}")
-        print(f"  模型来源: {self.model_source}")
-        print("=" * 50)
+
         
         # 检查SAM模型是否存在
         if hasattr(self, 'cb_sam_type') and hasattr(self, 'cb_sam_model'):
@@ -765,6 +766,17 @@ class AutoLabelDialog(QDialog):
                         break
                 
                 if not model_exists:
+                    if sam_type == "SAM3":
+                        QMessageBox.warning(
+                            self,
+                            "SAM3模型未找到",
+                            f"SAM3模型文件不存在: {model_file}\n\n"
+                            f"SAM3不支持自动下载。\n"
+                            f"请到以下页面下载 sam3.pt，放到项目根目录后重试：\n"
+                            f"{SAM3_DOWNLOAD_URL}"
+                        )
+                        return
+
                     # 模型不存在，提示用户下载
                     reply = QMessageBox.question(
                         self,
@@ -956,6 +968,17 @@ class AutoLabelDialog(QDialog):
         layout.addRow(self.chk_sam_retina)
         
         return group
+
+    def create_sam_usage_group(self) -> QGroupBox:
+        """创建SAM使用方式组"""
+        group = QGroupBox("使用方式")
+        group.setStyleSheet(self.get_group_style())
+        layout = QFormLayout(group)
+
+        self.cb_sam_usage_mode = QComboBox()
+        layout.addRow("模式:", self.cb_sam_usage_mode)
+        self._update_sam_usage_mode_options(self.cb_sam_type.currentText())
+        return group
     
     def on_sam_type_changed(self, sam_type: str):
         """SAM类型改变时更新型号列表"""
@@ -964,6 +987,22 @@ class AutoLabelDialog(QDialog):
             models = SAM_MODELS[sam_type]["models"]
             for name, file in models.items():
                 self.cb_sam_model.addItem(f"{name} ({file})", file)
+        self._update_sam_usage_mode_options(sam_type)
+
+    def _update_sam_usage_mode_options(self, sam_type: str, target_mode: str = None):
+        """根据SAM类型更新可选使用方式。"""
+        if not hasattr(self, "cb_sam_usage_mode"):
+            return
+        self.cb_sam_usage_mode.blockSignals(True)
+        self.cb_sam_usage_mode.clear()
+        self.cb_sam_usage_mode.addItem("普通标注", "normal")
+        if sam_type in ("SAM2", "SAM3"):
+            self.cb_sam_usage_mode.addItem("记忆标注", "memory")
+        if target_mode:
+            idx = self.cb_sam_usage_mode.findData(target_mode)
+            if idx >= 0:
+                self.cb_sam_usage_mode.setCurrentIndex(idx)
+        self.cb_sam_usage_mode.blockSignals(False)
     
     def get_sam_config(self) -> dict:
         """获取SAM配置"""
@@ -990,7 +1029,8 @@ class AutoLabelDialog(QDialog):
             'imgsz': int(self.sb_sam_imgsz.value()),
             'conf': self.sb_sam_conf.value(),
             'iou': self.sb_sam_iou.value(),
-            'retina_masks': self.chk_sam_retina.isChecked()
+            'retina_masks': self.chk_sam_retina.isChecked(),
+            'usage_mode': self.cb_sam_usage_mode.currentData() or "normal",
         }
 
     def load_sam_config(self):
@@ -1031,6 +1071,7 @@ class AutoLabelDialog(QDialog):
         self.sb_sam_conf.setValue(float(config.get("conf", 0.4)))
         self.sb_sam_iou.setValue(float(config.get("iou", 0.9)))
         self.chk_sam_retina.setChecked(bool(config.get("retina_masks", True)))
+        self._update_sam_usage_mode_options(sam_type, config.get("usage_mode", "normal"))
 
     def save_sam_config(self) -> bool:
         """保存SAM配置到配置文件。"""

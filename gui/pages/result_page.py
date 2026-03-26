@@ -7,7 +7,9 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, 
     QListWidgetItem, QPushButton, QSplitter, QScrollArea,
-    QGroupBox, QFormLayout, QGridLayout, QMessageBox, QFileDialog
+    QGroupBox, QFormLayout, QGridLayout, QMessageBox, QFileDialog,
+    QDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox, QLineEdit,
+    QTabWidget, QTextEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage
@@ -16,6 +18,296 @@ import cv2
 from typing import List, Dict
 
 from gui.styles import COLORS
+
+
+class ONNXExportDialog(QDialog):
+    """ONNX导出配置对话框"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ONNX导出配置")
+        self.setMinimumWidth(400)
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # 基本参数
+        basic_group = QGroupBox("基本参数")
+        basic_layout = QFormLayout(basic_group)
+        
+        # imgsz
+        self.spin_imgsz = QSpinBox()
+        self.spin_imgsz.setRange(32, 4096)
+        self.spin_imgsz.setValue(640)
+        self.spin_imgsz.setSingleStep(32)
+        basic_layout.addRow("输入尺寸 (imgsz):", self.spin_imgsz)
+        
+        # batch
+        self.spin_batch = QSpinBox()
+        self.spin_batch.setRange(1, 64)
+        self.spin_batch.setValue(1)
+        basic_layout.addRow("批量大小 (batch):", self.spin_batch)
+        
+        # opset
+        self.spin_opset = QSpinBox()
+        self.spin_opset.setRange(7, 17)
+        self.spin_opset.setValue(12)
+        basic_layout.addRow("ONNX Opset:", self.spin_opset)
+        
+        # device
+        self.combo_device = QComboBox()
+        self.combo_device.addItems(["cpu", "0", "1", "2", "3"])
+        basic_layout.addRow("设备 (device):", self.combo_device)
+        
+        layout.addWidget(basic_group)
+        
+        # 选项参数
+        options_group = QGroupBox("选项")
+        options_layout = QVBoxLayout(options_group)
+        
+        self.chk_half = QCheckBox("半精度 (half) - FP16")
+        self.chk_half.setChecked(False)
+        options_layout.addWidget(self.chk_half)
+        
+        self.chk_dynamic = QCheckBox("动态轴 (dynamic)")
+        self.chk_dynamic.setChecked(False)
+        options_layout.addWidget(self.chk_dynamic)
+        
+        self.chk_simplify = QCheckBox("简化模型 (simplify)")
+        self.chk_simplify.setChecked(True)
+        options_layout.addWidget(self.chk_simplify)
+        
+        self.chk_nms = QCheckBox("包含NMS (nms)")
+        self.chk_nms.setChecked(False)
+        options_layout.addWidget(self.chk_nms)
+        
+        layout.addWidget(options_group)
+        
+        # NMS参数组（仅在NMS选中时启用）
+        self.nms_group = QGroupBox("NMS参数")
+        self.nms_group.setEnabled(False)
+        nms_layout = QFormLayout(self.nms_group)
+        
+        # conf
+        self.spin_conf = QDoubleSpinBox()
+        self.spin_conf.setRange(0.01, 1.0)
+        self.spin_conf.setValue(0.25)
+        self.spin_conf.setDecimals(2)
+        self.spin_conf.setSingleStep(0.05)
+        nms_layout.addRow("置信度阈值 (conf):", self.spin_conf)
+        
+        # iou
+        self.spin_iou = QDoubleSpinBox()
+        self.spin_iou.setRange(0.1, 1.0)
+        self.spin_iou.setValue(0.45)
+        self.spin_iou.setDecimals(2)
+        self.spin_iou.setSingleStep(0.05)
+        nms_layout.addRow("IoU阈值 (iou):", self.spin_iou)
+        
+        # agnostic_nms
+        self.chk_agnostic_nms = QCheckBox("类别无关NMS (agnostic_nms)")
+        self.chk_agnostic_nms.setChecked(False)
+        nms_layout.addRow(self.chk_agnostic_nms)
+        
+        layout.addWidget(self.nms_group)
+        
+        # NMS选中时启用NMS参数组
+        self.chk_nms.stateChanged.connect(
+            lambda state: self.nms_group.setEnabled(state == Qt.CheckState.Checked.value)
+        )
+        
+        # 按钮
+        btn_layout = QHBoxLayout()
+        self.btn_ok = QPushButton("确定")
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(self.btn_ok)
+        btn_layout.addWidget(self.btn_cancel)
+        layout.addLayout(btn_layout)
+    
+    def get_config(self) -> dict:
+        """获取配置"""
+        config = {
+            'imgsz': self.spin_imgsz.value(),
+            'half': self.chk_half.isChecked(),
+            'dynamic': self.chk_dynamic.isChecked(),
+            'simplify': self.chk_simplify.isChecked(),
+            'opset': self.spin_opset.value(),
+            'nms': self.chk_nms.isChecked(),
+            'batch': self.spin_batch.value(),
+            'device': self.combo_device.currentText()
+        }
+        
+        # 如果启用NMS，添加NMS参数
+        if self.chk_nms.isChecked():
+            config['conf'] = self.spin_conf.value()
+            config['iou'] = self.spin_iou.value()
+            config['agnostic_nms'] = self.chk_agnostic_nms.isChecked()
+        
+        return config
+
+
+class TensorRTExportDialog(QDialog):
+    """TensorRT导出配置对话框"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("TensorRT导出配置")
+        self.setMinimumWidth(400)
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # 基本参数
+        basic_group = QGroupBox("基本参数")
+        basic_layout = QFormLayout(basic_group)
+        
+        # imgsz
+        self.spin_imgsz = QSpinBox()
+        self.spin_imgsz.setRange(32, 4096)
+        self.spin_imgsz.setValue(640)
+        self.spin_imgsz.setSingleStep(32)
+        basic_layout.addRow("输入尺寸 (imgsz):", self.spin_imgsz)
+        
+        # batch
+        self.spin_batch = QSpinBox()
+        self.spin_batch.setRange(1, 64)
+        self.spin_batch.setValue(1)
+        basic_layout.addRow("批量大小 (batch):", self.spin_batch)
+        
+        # workspace
+        self.spin_workspace = QSpinBox()
+        self.spin_workspace.setRange(1, 16)
+        self.spin_workspace.setValue(4)
+        basic_layout.addRow("工作空间 (workspace GB):", self.spin_workspace)
+        
+        # device
+        self.combo_device = QComboBox()
+        self.combo_device.addItems(["0", "1", "2", "3"])
+        basic_layout.addRow("设备 (device):", self.combo_device)
+        
+        layout.addWidget(basic_group)
+        
+        # 选项参数
+        options_group = QGroupBox("选项")
+        options_layout = QVBoxLayout(options_group)
+        
+        self.chk_half = QCheckBox("半精度 (half) - FP16")
+        self.chk_half.setChecked(True)
+        options_layout.addWidget(self.chk_half)
+        
+        self.chk_int8 = QCheckBox("INT8量化 (int8)")
+        self.chk_int8.setChecked(False)
+        options_layout.addWidget(self.chk_int8)
+        
+        self.chk_dynamic = QCheckBox("动态轴 (dynamic)")
+        self.chk_dynamic.setChecked(False)
+        options_layout.addWidget(self.chk_dynamic)
+        
+        self.chk_simplify = QCheckBox("简化模型 (simplify)")
+        self.chk_simplify.setChecked(True)
+        options_layout.addWidget(self.chk_simplify)
+        
+        self.chk_nms = QCheckBox("包含NMS (nms)")
+        self.chk_nms.setChecked(False)
+        options_layout.addWidget(self.chk_nms)
+        
+        layout.addWidget(options_group)
+        
+        # NMS参数组（仅在NMS选中时启用）
+        self.nms_group = QGroupBox("NMS参数")
+        self.nms_group.setEnabled(False)
+        nms_layout = QFormLayout(self.nms_group)
+        
+        # conf
+        self.spin_conf = QDoubleSpinBox()
+        self.spin_conf.setRange(0.01, 1.0)
+        self.spin_conf.setValue(0.25)
+        self.spin_conf.setDecimals(2)
+        self.spin_conf.setSingleStep(0.05)
+        nms_layout.addRow("置信度阈值 (conf):", self.spin_conf)
+        
+        # iou
+        self.spin_iou = QDoubleSpinBox()
+        self.spin_iou.setRange(0.1, 1.0)
+        self.spin_iou.setValue(0.45)
+        self.spin_iou.setDecimals(2)
+        self.spin_iou.setSingleStep(0.05)
+        nms_layout.addRow("IoU阈值 (iou):", self.spin_iou)
+        
+        # agnostic_nms
+        self.chk_agnostic_nms = QCheckBox("类别无关NMS (agnostic_nms)")
+        self.chk_agnostic_nms.setChecked(False)
+        nms_layout.addRow(self.chk_agnostic_nms)
+        
+        layout.addWidget(self.nms_group)
+        
+        # NMS选中时启用NMS参数组
+        self.chk_nms.stateChanged.connect(
+            lambda state: self.nms_group.setEnabled(state == Qt.CheckState.Checked.value)
+        )
+        
+        # INT8校准参数（仅在INT8选中时启用）
+        self.int8_group = QGroupBox("INT8校准参数")
+        self.int8_group.setEnabled(False)
+        int8_layout = QFormLayout(self.int8_group)
+        
+        self.edit_data = QLineEdit()
+        self.edit_data.setPlaceholderText("校准数据集路径（如：coco128.yaml）")
+        int8_layout.addRow("校准数据 (data):", self.edit_data)
+        
+        self.spin_fraction = QDoubleSpinBox()
+        self.spin_fraction.setRange(0.1, 1.0)
+        self.spin_fraction.setValue(1.0)
+        self.spin_fraction.setSingleStep(0.1)
+        int8_layout.addRow("数据比例 (fraction):", self.spin_fraction)
+        
+        layout.addWidget(self.int8_group)
+        
+        # INT8选中时启用校准参数
+        self.chk_int8.stateChanged.connect(
+            lambda state: self.int8_group.setEnabled(state == Qt.CheckState.Checked.value)
+        )
+        
+        # 按钮
+        btn_layout = QHBoxLayout()
+        self.btn_ok = QPushButton("确定")
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(self.btn_ok)
+        btn_layout.addWidget(self.btn_cancel)
+        layout.addLayout(btn_layout)
+    
+    def get_config(self) -> dict:
+        """获取配置"""
+        config = {
+            'imgsz': self.spin_imgsz.value(),
+            'half': self.chk_half.isChecked(),
+            'dynamic': self.chk_dynamic.isChecked(),
+            'simplify': self.chk_simplify.isChecked(),
+            'workspace': self.spin_workspace.value(),
+            'int8': self.chk_int8.isChecked(),
+            'nms': self.chk_nms.isChecked(),
+            'batch': self.spin_batch.value(),
+            'device': self.combo_device.currentText()
+        }
+        
+        # 如果启用NMS，添加NMS参数
+        if self.chk_nms.isChecked():
+            config['conf'] = self.spin_conf.value()
+            config['iou'] = self.spin_iou.value()
+            config['agnostic_nms'] = self.chk_agnostic_nms.isChecked()
+        
+        # 如果启用INT8，添加校准参数
+        if self.chk_int8.isChecked():
+            config['data'] = self.edit_data.text() or None
+            config['fraction'] = self.spin_fraction.value()
+        
+        return config
 
 
 class ResultPage(QWidget):
@@ -383,6 +675,19 @@ class ResultPage(QWidget):
             QMessageBox.warning(self, "提示", "未找到best.pt模型文件")
             return
         
+        # 显示导出配置对话框
+        export_config = {}
+        if format_type == 'onnx':
+            dialog = ONNXExportDialog(self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            export_config = dialog.get_config()
+        elif format_type == 'tensorrt':
+            dialog = TensorRTExportDialog(self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            export_config = dialog.get_config()
+        
         # 选择导出路径
         file_filter = ""
         if format_type == 'onnx':
@@ -407,8 +712,19 @@ class ResultPage(QWidget):
             # 加载模型
             model = YOLO(best_model)
             
+            # 构建导出参数
+            export_kwargs = {'format': format_type}
+            
+            # 添加配置参数（针对ONNX和TensorRT）
+            if format_type in ['onnx', 'tensorrt']:
+                export_kwargs.update(export_config)
+                # 过滤掉None值
+                export_kwargs = {k: v for k, v in export_kwargs.items() if v is not None}
+            
+            print(f"[导出] 参数: {export_kwargs}")
+            
             # 导出
-            model.export(format=format_type)
+            model.export(**export_kwargs)
             
             # 移动文件
             if format_type == 'onnx':

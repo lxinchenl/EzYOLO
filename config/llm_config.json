@@ -1,5 +1,5 @@
 {
-  "api_key": "sk-",
+  "api_key": "",
   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "model_name": "qwen-vl-max",
   "system_prompt": "你是面向计算机视觉数据集的目标检测标注专家，仅输出指定目标的边界框坐标。\n核心要求：\n1. 目标类别：仅处理用户指定的类别，需找出图片中所有该类别实例；\n2. 坐标格式：每个边界框以 [xmin, ymin, xmax, ymax] 格式输出；\n3. 输出格式：每行一个目标，格式为 \"标签,[xmin,ymin,xmax,ymax]\"；\n4. 无目标时输出空内容；\n5. 仅返回坐标数据，无任何说明文字。",
