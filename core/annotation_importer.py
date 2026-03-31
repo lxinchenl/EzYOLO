@@ -94,6 +94,7 @@ class AnnotationImporter:
                 
                 # 读取YOLO标注
                 annotations = self._parse_yolo_file(txt_file, image_info)
+                is_empty_label_file = txt_file.read_text(encoding='utf-8').strip() == ""
                 
                 # 导入标注
                 for ann in annotations:
@@ -116,6 +117,10 @@ class AnnotationImporter:
                         annotation_type=annotation_type,
                         data=ann['data']
                     )
+
+                # 空标签文件代表负样本，应视为“已标注”而不是继续保持 pending
+                if not annotations and is_empty_label_file:
+                    db.update_image_status(image_record['id'], 'annotated')
                 
                 imported += len(annotations)
                 

@@ -4619,12 +4619,14 @@ Esc - 取消操作
                 
                 # 导出每个图片的标注
                 exported_count = 0
+                negative_count = 0
                 for image in images:
                     image_id = image['id']
                     annotations = db.get_image_annotations(image_id)
+                    image_status = image.get('status', 'pending')
                     
-                    if annotations:
-                        # 创建标注文件
+                    if annotations or image_status == 'annotated':
+                        # 已标注图片都应生成标签文件；负样本生成空txt
                         filename = os.path.splitext(image['filename'])[0] + '.txt'
                         label_file = os.path.join(labels_dir, filename)
                         
@@ -4674,6 +4676,8 @@ Esc - 取消操作
                                             f.write(f"{class_id} {' '.join(normalized_points)}\n")
                         
                         exported_count += 1
+                        if not annotations:
+                            negative_count += 1
                 
                 # 创建classes.txt文件
                 classes_file = os.path.join(export_path, 'classes.txt')
@@ -4681,7 +4685,12 @@ Esc - 取消操作
                     for cls in sorted(self.classes, key=lambda x: x['id']):
                         f.write(f"{cls['name']}\n")
                 
-                QMessageBox.information(self, "导出成功", f"已导出 {exported_count} 个标注文件到\n{export_path}")
+                QMessageBox.information(
+                    self,
+                    "导出成功",
+                    f"已导出 {exported_count} 个标注文件到\n{export_path}\n\n"
+                    f"- 负样本空标签: {negative_count} 个"
+                )
                 
             elif export_format == "COCO格式":
                 # 导出COCO格式
@@ -5238,6 +5247,7 @@ Esc - 取消操作
             # 复制图片并导出标注
             copied_count = 0
             exported_count = 0
+            negative_count = 0
             
             for image in images:
                 # 复制图片
@@ -5250,9 +5260,10 @@ Esc - 取消操作
                 # 导出标注
                 image_id = image['id']
                 annotations = db.get_image_annotations(image_id)
+                image_status = image.get('status', 'pending')
                 
-                if annotations:
-                    # 创建标注文件
+                if annotations or image_status == 'annotated':
+                    # 已标注图片都应生成标签文件；负样本生成空txt
                     filename = os.path.splitext(image['filename'])[0] + '.txt'
                     label_file = os.path.join(labels_dir, filename)
                     
@@ -5305,6 +5316,8 @@ Esc - 取消操作
                                         f.write(f"{class_id} {' '.join(normalized_points)}\n")
                     
                     exported_count += 1
+                    if not annotations:
+                        negative_count += 1
             
             # 创建classes.txt文件
             classes_file = os.path.join(dataset_dir, 'classes.txt')
@@ -5326,9 +5339,14 @@ names: {[cls['name'] for cls in sorted(self.classes, key=lambda x: x['id'])]}
             with open(yaml_file, 'w', encoding='utf-8') as f:
                 f.write(yaml_content)
             
-            QMessageBox.information(self, "导出成功", f"已导出完整数据集到\n{dataset_dir}\n\n" 
-                                   f"- 复制图片: {copied_count} 张\n" 
-                                   f"- 导出标注: {exported_count} 个")
+            QMessageBox.information(
+                self,
+                "导出成功",
+                f"已导出完整数据集到\n{dataset_dir}\n\n"
+                f"- 复制图片: {copied_count} 张\n"
+                f"- 导出标注: {exported_count} 个\n"
+                f"- 负样本空标签: {negative_count} 个"
+            )
             
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出过程中出错:\n{str(e)}")
