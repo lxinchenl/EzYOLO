@@ -282,6 +282,37 @@ class Database:
                 )
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_project_images_by_class(self, project_id: int, class_id: int) -> List[Dict]:
+        """获取项目下包含指定类别的图像（按图片去重）"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DISTINCT images.*
+                FROM images
+                INNER JOIN annotations ON images.id = annotations.image_id
+                WHERE images.project_id = ? AND annotations.class_id = ?
+                ORDER BY images.created_at
+            """, (project_id, class_id))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_negative_sample_images(self, project_id: int, annotated_only: bool = True) -> List[Dict]:
+        """获取项目下的负样本图像（已标注但无任何标注框）"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            query = """
+                SELECT images.*
+                FROM images
+                LEFT JOIN annotations ON images.id = annotations.image_id
+                WHERE images.project_id = ? AND annotations.id IS NULL
+            """
+            params = [project_id]
+            if annotated_only:
+                query += " AND images.status = ?"
+                params.append('annotated')
+            query += " ORDER BY images.created_at"
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
     def get_all_images(self) -> List[Dict]:
         """获取所有图像记录"""
         with self.get_connection() as conn:
