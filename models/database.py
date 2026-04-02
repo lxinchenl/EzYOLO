@@ -159,7 +159,12 @@ class Database:
             
             # 创建索引
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_images_project ON images(project_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_images_project_status ON images(project_id, status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_annotations_image ON annotations(image_id)")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_annotations_project_class_image "
+                "ON annotations(project_id, class_id, image_id)"
+            )
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_training_jobs_project ON training_jobs(project_id)")
             
             conn.commit()
@@ -295,6 +300,18 @@ class Database:
             """, (project_id, class_id))
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_project_image_counts_by_class(self, project_id: int) -> Dict[int, int]:
+        """按类别统计项目中包含该类别的图片数量（按图片去重）"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT class_id, COUNT(DISTINCT image_id) AS image_count
+                FROM annotations
+                WHERE project_id = ?
+                GROUP BY class_id
+            """, (project_id,))
+            return {row['class_id']: row['image_count'] for row in cursor.fetchall()}
+
     def get_negative_sample_images(self, project_id: int, annotated_only: bool = True) -> List[Dict]:
         """获取项目下的负样本图像（已标注但无任何标注框）"""
         with self.get_connection() as conn:
@@ -312,6 +329,24 @@ class Database:
             query += " ORDER BY images.created_at"
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_negative_sample_image_count(self, project_id: int, annotated_only: bool = True) -> int:
+        """获取项目下负样本图像数量"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            query = """
+                SELECT COUNT(*)
+                FROM images
+                LEFT JOIN annotations ON images.id = annotations.image_id
+                WHERE images.project_id = ? AND annotations.id IS NULL
+            """
+            params = [project_id]
+            if annotated_only:
+                query += " AND images.status = ?"
+                params.append('annotated')
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            return row[0] if row else 0
 
     def get_all_images(self) -> List[Dict]:
         """获取所有图像记录"""
@@ -422,7 +457,13 @@ class Database:
             
             return cursor.lastrowid
     
-    def update_annotation(self, annotation_id: int, data: Dict = None, class_id: int = None) -> bool:
+    def update_annotation(
+        self,
+        annotation_id: int,
+        data: Dict = None,
+        class_id: int = None,
+        class_name: str = None
+    ) -> bool:
         """
         更新标注
         
@@ -430,6 +471,7 @@ class Database:
             annotation_id: 标注ID
             data: 标注数据
             class_id: 类别ID
+            class_name: 类别名称
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -444,6 +486,10 @@ class Database:
             if class_id is not None:
                 updates.append("class_id = ?")
                 values.append(class_id)
+
+            if class_name is not None:
+                updates.append("class_name = ?")
+                values.append(class_name)
             
             # 总是更新updated_at时间戳
             updates.append("updated_at = ?")

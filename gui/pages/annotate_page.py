@@ -383,6 +383,86 @@ class AnnotateImageLoadWorker(QThread):
         self._is_running = False
 
 
+class RandomSampleDeleteWorker(QThread):
+    """随机删除样本工作线程"""
+
+    progress_updated = pyqtSignal(int, int, str)  # 当前进度, 总数, 文件名
+    delete_finished = pyqtSignal(object)  # 删除结果
+    delete_failed = pyqtSignal(str)
+
+    def __init__(self, project_id: int, target_class_id: int, delete_count: int, current_image_id: Optional[int]):
+        super().__init__()
+        self.project_id = project_id
+        self.target_class_id = target_class_id
+        self.delete_count = delete_count
+        self.current_image_id = current_image_id
+        self._is_running = True
+
+    def run(self):
+        try:
+            if self.target_class_id == NEGATIVE_SAMPLE_CLASS_ID:
+                candidate_images = db.get_negative_sample_images(self.project_id, annotated_only=True)
+            else:
+                candidate_images = db.get_project_images_by_class(self.project_id, self.target_class_id)
+
+            available_count = len(candidate_images)
+            total_count = min(self.delete_count, available_count)
+            if total_count <= 0:
+                self.delete_finished.emit({
+                    'deleted_count': 0,
+                    'failed_files': [],
+                    'current_image_deleted': False,
+                    'canceled': False,
+                    'available_count': available_count,
+                    'total_count': 0,
+                })
+                return
+
+            target_images = random.sample(candidate_images, total_count)
+            deleted_count = 0
+            failed_files = []
+            current_image_deleted = False
+
+            for index, image in enumerate(target_images, start=1):
+                if not self._is_running:
+                    self.delete_finished.emit({
+                        'deleted_count': deleted_count,
+                        'failed_files': failed_files,
+                        'current_image_deleted': current_image_deleted,
+                        'canceled': True,
+                        'available_count': available_count,
+                        'total_count': total_count,
+                    })
+                    return
+
+                filename = image.get('filename', str(image.get('id')))
+                self.progress_updated.emit(index - 1, total_count, filename)
+
+                if image['id'] == self.current_image_id:
+                    current_image_deleted = True
+
+                if db.delete_image(image['id']):
+                    deleted_count += 1
+                else:
+                    failed_files.append(filename)
+
+                self.progress_updated.emit(index, total_count, filename)
+
+            self.delete_finished.emit({
+                'deleted_count': deleted_count,
+                'failed_files': failed_files,
+                'current_image_deleted': current_image_deleted,
+                'canceled': False,
+                'available_count': available_count,
+                'total_count': total_count,
+            })
+        except Exception as e:
+            self.delete_failed.emit(str(e))
+
+    def stop(self):
+        self._is_running = False
+
+
 class AnnotationCanvas(QFrame):
     """标注画布组件"""
     
@@ -2163,6 +2243,12 @@ class AnnotatePage(QWidget):
         self.history = []  # 撤销历史
         self.history_index = -1
         self.load_worker = None  # 加载线程
+        self.random_delete_worker = None
+        self.random_delete_progress = None
+        self._sample_stats_project_id = None
+        self._sample_class_counts_cache = {}
+        self._negative_sample_count_cache = 0
+        self._sample_stats_dirty = True
         
         # 自动标注相关属性
         self.auto_label_dialog = None
@@ -2628,16 +2714,32 @@ class AnnotatePage(QWidget):
         self.class_list.customContextMenuRequested.connect(self.show_class_context_menu)
         class_layout.addWidget(self.class_list)
         
+        compact_action_button_height = 24
+        compact_action_button_style = f"""
+            QPushButton {{
+                min-height: {compact_action_button_height}px;
+                max-height: {compact_action_button_height}px;
+                padding: 0 10px;
+            }}
+        """
+
         # 添加类别按钮
         self.btn_add_class = QPushButton("+ 添加类别")
         self.btn_add_class.clicked.connect(self.add_class)
-        self.btn_add_class.setMinimumHeight(34)
+        self.btn_add_class.setFixedHeight(compact_action_button_height)
         self.btn_add_class.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.btn_add_class.setStyleSheet(compact_action_button_style)
+        self.btn_apply_attr = QPushButton("应用修改")
+        self.btn_apply_attr.clicked.connect(self.apply_annotation_changes)
+        self.btn_apply_attr.setFixedHeight(compact_action_button_height)
+        self.btn_apply_attr.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.btn_apply_attr.setStyleSheet(compact_action_button_style)
+        self.btn_apply_attr.setEnabled(False)
         class_button_row = QHBoxLayout()
         class_button_row.setContentsMargins(0, 0, 0, 0)
         class_button_row.setSpacing(8)
         class_button_row.addWidget(self.btn_add_class, 1)
-        class_button_row.addStretch(1)
+        class_button_row.addWidget(self.btn_apply_attr, 1)
         class_layout.addLayout(class_button_row)
         
         layout.addWidget(class_group)
@@ -2658,13 +2760,6 @@ class AnnotatePage(QWidget):
                 color: {COLORS['text_primary']};
             }}
         """
-        button_style = f"""
-            QPushButton {{
-                min-height: 34px;
-                padding: 5px 10px;
-            }}
-        """
-        
         # 当前标注类别
         self.attr_class = QComboBox()
         self.attr_class.currentIndexChanged.connect(self.on_attr_class_changed)
@@ -2700,20 +2795,16 @@ class AnnotatePage(QWidget):
         self.sample_hint.setStyleSheet(f"color: {COLORS['text_secondary']}; padding: 2px 0;")
         attr_layout.addRow(self.sample_hint)
 
-        # 应用按钮
-        self.btn_apply_attr = QPushButton("应用类别修改")
-        self.btn_apply_attr.clicked.connect(self.apply_annotation_changes)
-        self.btn_apply_attr.setStyleSheet(button_style)
-        self.btn_apply_attr.hide()
-
         self.btn_mark_negative_sample = QPushButton("标注为负样本")
         self.btn_mark_negative_sample.clicked.connect(self.mark_current_image_as_negative_sample)
-        self.btn_mark_negative_sample.setStyleSheet(button_style)
+        self.btn_mark_negative_sample.setFixedHeight(compact_action_button_height)
+        self.btn_mark_negative_sample.setStyleSheet(compact_action_button_style)
         self.btn_mark_negative_sample.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self.btn_delete_random_samples = QPushButton("随机删除样本")
         self.btn_delete_random_samples.clicked.connect(self.delete_random_samples_for_target)
-        self.btn_delete_random_samples.setStyleSheet(button_style)
+        self.btn_delete_random_samples.setFixedHeight(compact_action_button_height)
+        self.btn_delete_random_samples.setStyleSheet(compact_action_button_style)
         self.btn_delete_random_samples.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         action_button_widget = QWidget()
@@ -2829,6 +2920,7 @@ class AnnotatePage(QWidget):
         """设置当前项目"""
         # 即使项目ID相同，也重新加载数据（确保图片列表更新）
         self.current_project_id = project_id
+        self._invalidate_sample_stats_cache()
         
         # 显示加载动画
         self.loading_overlay = LoadingOverlay(self, "正在加载项目数据...")
@@ -2933,6 +3025,7 @@ class AnnotatePage(QWidget):
         
         # 从数据库获取图片列表（很快）
         self.images = db.get_project_images(self.current_project_id)
+        self._invalidate_sample_stats_cache()
         
         # 先创建所有列表项（显示占位符）
         for image in self.images:
@@ -2989,6 +3082,7 @@ class AnnotatePage(QWidget):
         current_attr_class = self.attr_class.currentData()
         current_sample_target = self.sample_target_class.currentData()
         current_selected_class = self.current_class_id
+        class_sample_counts, negative_sample_count = self._get_sample_stats()
         self.class_list.clear()
         self.attr_class.clear()
         self.sample_target_class.blockSignals(True)
@@ -3001,7 +3095,7 @@ class AnnotatePage(QWidget):
         self.canvas.class_colors = class_colors
         
         for cls in self.classes:
-            sample_count = self.get_class_sample_count(cls['id'])
+            sample_count = class_sample_counts.get(cls['id'], 0)
             # 创建带颜色的列表项
             item = QListWidgetItem(f"■ {cls['name']} ({sample_count})")
             item.setData(Qt.ItemDataRole.UserRole, cls['id'])
@@ -3032,7 +3126,7 @@ class AnnotatePage(QWidget):
         elif self.sample_target_class.count() > 0:
             self.sample_target_class.setCurrentIndex(0)
         self.sample_target_class.blockSignals(False)
-        self.update_sample_control_panel()
+        self.update_sample_control_panel(class_sample_counts, negative_sample_count)
         
         # 默认选中第一个类别
         if self.class_list.count() > 0:
@@ -3054,12 +3148,106 @@ class AnnotatePage(QWidget):
 
         return db.get_project_images_by_class(self.current_project_id, target_class_id)
 
+    def _invalidate_sample_stats_cache(self):
+        """标记样本统计缓存失效。"""
+        self._sample_stats_dirty = True
+
+    def _get_sample_stats(self, force_refresh=False):
+        """获取当前项目样本统计缓存。"""
+        if not self.current_project_id:
+            self._sample_stats_project_id = None
+            self._sample_class_counts_cache = {}
+            self._negative_sample_count_cache = 0
+            self._sample_stats_dirty = False
+            return {}, 0
+
+        should_refresh = (
+            force_refresh
+            or self._sample_stats_dirty
+            or self._sample_stats_project_id != self.current_project_id
+        )
+        if should_refresh:
+            self._sample_class_counts_cache = db.get_project_image_counts_by_class(self.current_project_id)
+            self._negative_sample_count_cache = db.get_negative_sample_image_count(
+                self.current_project_id,
+                annotated_only=True
+            )
+            self._sample_stats_project_id = self.current_project_id
+            self._sample_stats_dirty = False
+
+        return self._sample_class_counts_cache, self._negative_sample_count_cache
+
+    def get_project_sample_counts(self, force_refresh=False):
+        """获取当前项目各类别对应的样本图数量。"""
+        return self._get_sample_stats(force_refresh=force_refresh)[0]
+
+    def get_negative_sample_count(self, force_refresh=False):
+        """获取当前项目负样本图数量。"""
+        return self._get_sample_stats(force_refresh=force_refresh)[1]
+
     def get_class_sample_count(self, class_id):
         """获取某个类别对应的样本图数量"""
-        return len(self.get_sample_target_images(class_id))
+        return self.get_project_sample_counts().get(class_id, 0)
 
-    def refresh_class_list_counts(self):
+    def _get_selected_class_list_id(self) -> Optional[int]:
+        """获取类别列表当前选中的类别ID。"""
+        current_item = self.class_list.currentItem()
+        if current_item is None:
+            return None
+        return current_item.data(Qt.ItemDataRole.UserRole)
+
+    def _set_class_list_selection(self, class_id: Optional[int]):
+        """按类别ID同步类别列表选中状态。"""
+        if class_id is None:
+            self.class_list.clearSelection()
+            self._refresh_annotation_class_controls()
+            return
+
+        for row in range(self.class_list.count()):
+            item = self.class_list.item(row)
+            if item and item.data(Qt.ItemDataRole.UserRole) == class_id:
+                self.class_list.setCurrentRow(row)
+                self.current_class_id = class_id
+                self.canvas.current_class_id = class_id
+                break
+
+        self._sync_attr_class_combo_from_list()
+        self._refresh_annotation_class_controls()
+
+    def _sync_attr_class_combo_from_list(self):
+        """将类别列表当前选择同步到属性下拉框。"""
+        class_id = self._get_selected_class_list_id()
+        self.attr_class.blockSignals(True)
+        if class_id is None:
+            self.attr_class.setCurrentIndex(-1)
+        else:
+            index = self.attr_class.findData(class_id)
+            if index >= 0:
+                self.attr_class.setCurrentIndex(index)
+        self.attr_class.blockSignals(False)
+
+    def _refresh_annotation_class_controls(self):
+        """根据当前标注和类别选择刷新“应用修改”按钮状态。"""
+        selected_annotation_id = self.canvas.selected_annotation_id
+        if selected_annotation_id is None:
+            self.btn_apply_attr.setEnabled(False)
+            return
+
+        annotation = next((ann for ann in self.annotations if ann['id'] == selected_annotation_id), None)
+        if annotation is None:
+            self.btn_apply_attr.setEnabled(False)
+            return
+
+        selected_class_id = self._get_selected_class_list_id()
+        self.btn_apply_attr.setEnabled(
+            selected_class_id is not None and selected_class_id != annotation.get('class_id')
+        )
+
+    def refresh_class_list_counts(self, class_sample_counts=None):
         """刷新类别列表中的样本数量显示"""
+        if class_sample_counts is None:
+            class_sample_counts = self.get_project_sample_counts()
+
         for row in range(self.class_list.count()):
             item = self.class_list.item(row)
             if not item:
@@ -3068,12 +3256,19 @@ class AnnotatePage(QWidget):
             class_info = next((cls for cls in self.classes if cls['id'] == class_id), None)
             if not class_info:
                 continue
-            sample_count = self.get_class_sample_count(class_id)
+            sample_count = class_sample_counts.get(class_id, 0)
             item.setText(f"■ {class_info['name']} ({sample_count})")
 
-    def update_sample_control_panel(self):
+    def update_sample_control_panel(self, class_sample_counts=None, negative_sample_count=None):
         """刷新样本调节面板"""
-        self.refresh_class_list_counts()
+        if class_sample_counts is None or negative_sample_count is None:
+            cached_class_counts, cached_negative_sample_count = self._get_sample_stats()
+            if class_sample_counts is None:
+                class_sample_counts = cached_class_counts
+            if negative_sample_count is None:
+                negative_sample_count = cached_negative_sample_count
+
+        self.refresh_class_list_counts(class_sample_counts)
         target_class_id = self.sample_target_class.currentData()
         if target_class_id is None:
             self.sample_count_label.setText("0")
@@ -3083,7 +3278,10 @@ class AnnotatePage(QWidget):
             self.sample_delete_count.blockSignals(False)
             return
 
-        sample_count = len(self.get_sample_target_images(target_class_id))
+        if target_class_id == NEGATIVE_SAMPLE_CLASS_ID:
+            sample_count = negative_sample_count
+        else:
+            sample_count = class_sample_counts.get(target_class_id, 0)
         self.sample_count_label.setText(str(sample_count))
 
         self.sample_delete_count.blockSignals(True)
@@ -3626,6 +3824,8 @@ class AnnotatePage(QWidget):
             except Exception:
                 failed += 1
         self.load_annotations()
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
         QMessageBox.information(
             self,
             "批量记忆推理",
@@ -3784,7 +3984,15 @@ class AnnotatePage(QWidget):
                             source_classes = config.get('source_classes', [])
                             target_class = config.get('target_class')
                             if annotation.get('class_id') in source_classes:
-                                db.update_annotation(annotation['id'], class_id=target_class)
+                                target_class_info = next(
+                                    (cls for cls in self.classes if cls['id'] == target_class),
+                                    None
+                                )
+                                db.update_annotation(
+                                    annotation['id'],
+                                    class_id=target_class,
+                                    class_name=target_class_info['name'] if target_class_info else None
+                                )
                                 modified_count += 1
                 
                 processed_count += 1
@@ -3799,8 +4007,10 @@ class AnnotatePage(QWidget):
             )
             
             # 刷新当前图片的标注显示
+            self._invalidate_sample_stats_cache()
             if self.current_image_id:
                 self.load_annotations()
+            self.update_sample_control_panel()
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"批量处理出错: {str(e)}")
@@ -4157,6 +4367,8 @@ class AnnotatePage(QWidget):
             self.annotations = db.get_image_annotations(self.current_image_id)
             self.canvas.set_annotations(self.annotations)
             self.update_status_bar()
+            self._invalidate_sample_stats_cache()
+            self.update_sample_control_panel()
     
     def update_status_bar(self):
         """更新状态栏"""
@@ -4183,6 +4395,8 @@ class AnnotatePage(QWidget):
             self.current_class_id = current_item.data(Qt.ItemDataRole.UserRole)
             # 更新画布当前类别
             self.canvas.current_class_id = self.current_class_id
+            self._sync_attr_class_combo_from_list()
+        self._refresh_annotation_class_controls()
     
     def filter_images(self, filter_text: str):
         """筛选图片"""
@@ -4297,6 +4511,7 @@ class AnnotatePage(QWidget):
         self.annotations = db.get_image_annotations(self.current_image_id)
         self.canvas.set_annotations(self.annotations)
         self.update_status_bar()
+        self._refresh_annotation_class_controls()
     
     def set_tool(self, tool: str):
         """设置工具"""
@@ -4343,6 +4558,7 @@ class AnnotatePage(QWidget):
         
         # 更新图片列表显示
         self.update_image_list_display()
+        self._invalidate_sample_stats_cache()
         self.update_sample_control_panel()
     
     def on_annotation_selected(self, annotation_id: int):
@@ -4378,16 +4594,17 @@ class AnnotatePage(QWidget):
         # 重新加载
         self.load_annotations()
         self.canvas.selected_annotation_id = None
-        self.clear_attribute_panel()
+        self.clear_attribute_panel(refresh_sample_panel=False)
         
         # 检查图片是否还有标注
-        remaining_annotations = db.get_image_annotations(self.current_image_id)
+        remaining_annotations = self.annotations
         if not remaining_annotations:
             # 如果没有标注了，更新状态为未标注
             db.update_image_status(self.current_image_id, 'pending')
             # 更新图片列表显示
             self.update_image_list_display()
 
+        self._invalidate_sample_stats_cache()
         self.update_sample_control_panel()
     
     def delete_selected_annotation(self):
@@ -4397,24 +4614,21 @@ class AnnotatePage(QWidget):
     
     def update_attribute_panel(self, annotation: dict):
         """更新属性面板"""
-        self.attr_class.blockSignals(True)
-
         # 设置类别
         class_id = annotation.get('class_id', 0)
-        index = self.attr_class.findData(class_id)
-        if index >= 0:
-            self.attr_class.setCurrentIndex(index)
-        
-        self.attr_class.blockSignals(False)
+        self._set_class_list_selection(class_id)
     
-    def clear_attribute_panel(self):
+    def clear_attribute_panel(self, refresh_sample_panel=True):
         """清空属性面板"""
         self.attr_class.blockSignals(True)
+        self.attr_class.setCurrentIndex(-1)
         self.attr_class.blockSignals(False)
         self.sample_delete_count.blockSignals(True)
         self.sample_delete_count.setValue(0)
         self.sample_delete_count.blockSignals(False)
-        self.update_sample_control_panel()
+        if refresh_sample_panel:
+            self.update_sample_control_panel()
+        self._refresh_annotation_class_controls()
     
     def on_attr_class_changed(self, index):
         """属性类别改变事件"""
@@ -4428,6 +4642,7 @@ class AnnotatePage(QWidget):
         class_id = self.attr_class.currentData()
         if class_id is not None:
             annotation['class_id'] = class_id
+            self._set_class_list_selection(class_id)
             self.canvas.update()
     
     def apply_annotation_changes(self):
@@ -4441,36 +4656,36 @@ class AnnotatePage(QWidget):
             return
         
         # 获取新的类别信息
-        class_id = self.attr_class.currentData()
+        class_id = self._get_selected_class_list_id()
         if class_id is None:
             QMessageBox.warning(self, "提示", "当前没有可用类别")
             return
 
         class_info = next((cls for cls in self.classes if cls['id'] == class_id), None)
         class_name = class_info['name'] if class_info else 'unknown'
-        
+
+        if class_id == annotation.get('class_id'):
+            self._refresh_annotation_class_controls()
+            return
+
         # 更新标注数据
         annotation['class_id'] = class_id
         annotation['class_name'] = class_name
-        
+
         # 更新到数据库
-        # 先删除旧标注，再添加新标注（简化处理）
-        db.delete_annotation(annotation['id'])
-        new_id = db.add_annotation(
-            image_id=self.current_image_id,
-            project_id=self.current_project_id,
-            class_id=class_id,
-            class_name=class_name,
-            annotation_type=annotation['type'],
-            data=annotation['data']
-        )
-        
-        # 更新选中状态
-        annotation['id'] = new_id
-        self.canvas.selected_annotation_id = new_id
+        updated = db.update_annotation(annotation['id'], class_id=class_id, class_name=class_name)
+        if not updated:
+            QMessageBox.warning(self, "提示", "标注类别修改失败")
+            return
         
         # 刷新显示
         self.load_annotations()
+        self.canvas.selected_annotation_id = annotation['id']
+        updated_annotation = next((ann for ann in self.annotations if ann['id'] == annotation['id']), None)
+        if updated_annotation:
+            self.update_attribute_panel(updated_annotation)
+        self.canvas.update()
+        self._invalidate_sample_stats_cache()
         self.update_sample_control_panel()
         
         QMessageBox.information(self, "成功", "标注修改已保存")
@@ -4479,6 +4694,10 @@ class AnnotatePage(QWidget):
         """按目标标签随机删除样本图像"""
         if not self.current_project_id:
             QMessageBox.warning(self, "提示", "请先选择一个项目")
+            return
+
+        if self.random_delete_worker and self.random_delete_worker.isRunning():
+            QMessageBox.warning(self, "提示", "随机删样任务仍在执行，请等待完成后再试")
             return
 
         target_class_id = self.sample_target_class.currentData()
@@ -4493,8 +4712,11 @@ class AnnotatePage(QWidget):
             QMessageBox.warning(self, "提示", "删样数量必须大于 0")
             return
 
-        candidate_images = self.get_sample_target_images(target_class_id)
-        available_count = len(candidate_images)
+        class_sample_counts, negative_sample_count = self._get_sample_stats()
+        if target_class_id == NEGATIVE_SAMPLE_CLASS_ID:
+            available_count = negative_sample_count
+        else:
+            available_count = class_sample_counts.get(target_class_id, 0)
         if available_count == 0:
             QMessageBox.warning(self, "提示", f"当前标签“{target_name}”没有可删除的样本")
             return
@@ -4511,18 +4733,69 @@ class AnnotatePage(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        target_images = random.sample(candidate_images, delete_count)
-        deleted_count = 0
-        failed_files = []
-        current_image_deleted = False
+        from PyQt6.QtWidgets import QProgressDialog
 
-        for image in target_images:
-            if image['id'] == self.current_image_id:
-                current_image_deleted = True
-            if db.delete_image(image['id']):
-                deleted_count += 1
-            else:
-                failed_files.append(image.get('filename', str(image['id'])))
+        self.random_delete_progress = QProgressDialog(
+            f"正在准备删除“{target_name}”样本图...",
+            "取消",
+            0,
+            delete_count,
+            self
+        )
+        self.random_delete_progress.setWindowTitle("随机删除样本")
+        self.random_delete_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.random_delete_progress.setAutoClose(False)
+        self.random_delete_progress.setAutoReset(False)
+        self.random_delete_progress.setMinimumDuration(0)
+        self.random_delete_progress.setValue(0)
+
+        self.btn_delete_random_samples.setEnabled(False)
+        self.random_delete_worker = RandomSampleDeleteWorker(
+            self.current_project_id,
+            target_class_id,
+            delete_count,
+            self.current_image_id
+        )
+        self.random_delete_worker.progress_updated.connect(self.on_random_delete_progress)
+        self.random_delete_worker.delete_finished.connect(
+            lambda result, current_target_name=target_name: self.on_random_delete_finished(current_target_name, result)
+        )
+        self.random_delete_worker.delete_failed.connect(self.on_random_delete_failed)
+        self.random_delete_progress.canceled.connect(self.random_delete_worker.stop)
+        self.random_delete_worker.start()
+        self.random_delete_progress.show()
+
+    def on_random_delete_progress(self, current: int, total: int, filename: str):
+        """随机删样本进度回调"""
+        if not self.random_delete_progress:
+            return
+        self.random_delete_progress.setMaximum(max(total, 1))
+        self.random_delete_progress.setValue(current)
+        self.random_delete_progress.setLabelText(
+            f"正在删除样本图 ({current}/{total})：{filename}"
+        )
+
+    def _cleanup_random_delete_task(self):
+        """清理随机删样本任务状态"""
+        if self.random_delete_progress:
+            self.random_delete_progress.close()
+            self.random_delete_progress.deleteLater()
+            self.random_delete_progress = None
+        if self.random_delete_worker:
+            self.random_delete_worker.deleteLater()
+            self.random_delete_worker = None
+        self.btn_delete_random_samples.setEnabled(True)
+
+    def on_random_delete_finished(self, target_name: str, result: dict):
+        """随机删样本完成回调"""
+        self._cleanup_random_delete_task()
+        self._invalidate_sample_stats_cache()
+
+        deleted_count = result.get('deleted_count', 0)
+        failed_files = result.get('failed_files', [])
+        current_image_deleted = result.get('current_image_deleted', False)
+        canceled = result.get('canceled', False)
+        total_count = result.get('total_count', 0)
 
         self.load_image_list()
 
@@ -4540,10 +4813,16 @@ class AnnotatePage(QWidget):
             self.canvas.selected_annotation_id = None
             self.canvas.set_annotations([])
             self.canvas.load_image("")
-            self.clear_attribute_panel()
+            self.clear_attribute_panel(refresh_sample_panel=False)
             self.update_status_bar()
 
-        self.update_sample_control_panel()
+        if canceled:
+            QMessageBox.information(
+                self,
+                "删除已取消",
+                f"随机删样已取消。\n已删除 {deleted_count}/{total_count} 张“{target_name}”样本图"
+            )
+            return
 
         if failed_files:
             QMessageBox.warning(
@@ -4558,6 +4837,11 @@ class AnnotatePage(QWidget):
                 "删除完成",
                 f"已随机删除 {deleted_count} 张“{target_name}”样本图"
             )
+
+    def on_random_delete_failed(self, error_message: str):
+        """随机删样本失败回调"""
+        self._cleanup_random_delete_task()
+        QMessageBox.critical(self, "删除失败", f"随机删除样本出错: {error_message}")
 
     def _get_next_image_shortcut_key(self) -> str:
         """获取当前“下一张”快捷键。"""
@@ -4637,7 +4921,7 @@ class AnnotatePage(QWidget):
 
         self.load_annotations()
         self.canvas.selected_annotation_id = None
-        self.clear_attribute_panel()
+        self.clear_attribute_panel(refresh_sample_panel=False)
         self.update_image_list_display()
         self.update_sample_control_panel()
 
@@ -4738,6 +5022,7 @@ class AnnotatePage(QWidget):
         db.update_project(self.current_project_id, classes=self.classes)
         
         # 更新显示
+        self._invalidate_sample_stats_cache()
         self.update_class_list()
         self.load_annotations()
     
@@ -4829,6 +5114,8 @@ class AnnotatePage(QWidget):
         
         self.history_index -= 1
         self.load_annotations()
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
     
     def update_status_bar(self):
         """更新状态栏"""
@@ -5270,6 +5557,8 @@ class AnnotatePage(QWidget):
         # 重新加载标注
         self.load_annotations()
         self.update_image_list_display()
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
         
         QMessageBox.information(self, "完成", f"{message}\n已添加 {added_count} 个标注")
     
@@ -5490,6 +5779,8 @@ class AnnotatePage(QWidget):
         # 重新加载标注
         self.load_annotations()
         self.update_image_list_display()
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
         
         QMessageBox.information(self, "完成", 
             f"批量推理完成!\n"
