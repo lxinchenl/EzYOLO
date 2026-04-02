@@ -6,5 +6,5 @@
   "conf": 0.2,
   "iou": 0.9,
   "retina_masks": true,
-  "usage_mode": "normal"
+  "usage_mode": "memory"
 }

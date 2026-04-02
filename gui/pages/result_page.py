@@ -697,9 +697,13 @@ class ResultPage(QWidget):
         elif format_type == 'torchscript':
             file_filter = "TorchScript files (*.pt)"
         
+        default_name = f"best.{format_type}"
+        if format_type == 'tensorrt':
+            default_name = "best.engine"
+        
         save_path, _ = QFileDialog.getSaveFileName(
             self, f"导出为{format_type.upper()}", 
-            os.path.join(project_dir, f"best.{format_type}"),
+            os.path.join(project_dir, default_name),
             file_filter
         )
         
@@ -712,8 +716,9 @@ class ResultPage(QWidget):
             # 加载模型
             model = YOLO(best_model)
             
-            # 构建导出参数
-            export_kwargs = {'format': format_type}
+            # 构建导出参数（Ultralytics 的 TensorRT 导出格式名是 engine）
+            export_format = 'engine' if format_type == 'tensorrt' else format_type
+            export_kwargs = {'format': export_format}
             
             # 添加配置参数（针对ONNX和TensorRT）
             if format_type in ['onnx', 'tensorrt']:
@@ -735,7 +740,8 @@ class ResultPage(QWidget):
                 export_path = os.path.join(project_dir, "weights", "best.torchscript.pt")
             
             if os.path.exists(export_path):
-                os.rename(export_path, save_path)
+                import shutil
+                shutil.move(export_path, save_path)
                 QMessageBox.information(self, "成功", f"模型已导出为 {save_path}")
             else:
                 QMessageBox.warning(self, "失败", "导出失败，请检查日志")

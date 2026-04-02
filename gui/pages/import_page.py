@@ -1305,13 +1305,23 @@ class ImportPage(QWidget):
             deleted = 0
             failed = 0
             
-            for image in self.images:
+            # 使用副本迭代，避免删除过程中修改原列表导致遍历异常
+            images_snapshot = list(self.images)
+            for image in images_snapshot:
                 if db.delete_image(image['id']):
                     deleted += 1
                 else:
                     failed += 1
-            
-            self.load_project_images()
+
+            # 全部删除成功时，直接本地清空，避免触发整页重载
+            if failed == 0:
+                self.images.clear()
+                self.image_list.clear()
+                self.thumbnail_cache.clear()
+                self.update_status_bar()
+            else:
+                # 部分失败时回退到全量重载，确保UI与数据库一致
+                self.load_project_images()
             
             if failed == 0:
                 QMessageBox.information(self, "清空完成", f"已成功删除 {deleted} 张图片")
@@ -1337,15 +1347,43 @@ class ImportPage(QWidget):
         
         deleted = 0
         failed = 0
+        deleted_ids = []
         
         for item in selected_items:
             image_id = item.data(Qt.ItemDataRole.UserRole)
             if db.delete_image(image_id):
                 deleted += 1
+                deleted_ids.append(image_id)
             else:
                 failed += 1
-        
-        self.load_project_images()
+
+        # 仅移除已成功删除的项，避免每次删除都整页重载
+        if deleted_ids:
+            deleted_id_set = set(deleted_ids)
+
+            # 先更新内存数据
+            removed_storage_paths = {
+                img.get('storage_path', '')
+                for img in self.images
+                if img.get('id') in deleted_id_set
+            }
+            self.images = [img for img in self.images if img.get('id') not in deleted_id_set]
+
+            # 清理缩略图缓存
+            for path in removed_storage_paths:
+                if path in self.thumbnail_cache:
+                    del self.thumbnail_cache[path]
+
+            # 再移除列表项（倒序删除避免索引变化）
+            rows_to_remove = []
+            for i in range(self.image_list.count()):
+                item = self.image_list.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) in deleted_id_set:
+                    rows_to_remove.append(i)
+            for row in reversed(rows_to_remove):
+                self.image_list.takeItem(row)
+
+            self.update_status_bar()
         
         if failed == 0:
             QMessageBox.information(self, "删除完成", f"已成功删除 {deleted} 张图片")
