@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QRadioButton, QSpinBox, QDoubleSpinBox, QFormLayout,
     QGroupBox, QCheckBox, QSlider, QTextEdit, QInputDialog,
     QSizePolicy,
-    QColorDialog, QDialog
+    QColorDialog, QDialog, QApplication, QAbstractSpinBox
 )
 import math
 
@@ -22,7 +22,7 @@ from gui.pages.batch_process_dialog import BatchProcessDialog
 from core.auto_labeler import BatchLabelingManager
 from core.model_manager import ModelManager
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize, QPoint, QRect
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QKeyEvent, QMouseEvent, QWheelEvent, QAction, QIcon, QPen, QBrush
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QKeyEvent, QMouseEvent, QWheelEvent, QAction, QIcon, QPen, QBrush, QShortcut, QKeySequence
 import cv2
 import numpy as np
 from pathlib import Path
@@ -2170,6 +2170,8 @@ class AnnotatePage(QWidget):
         self.batch_labeling_manager = None
         self.sam_memory_objects = []
         self.sam_memory_dialog = None
+        self.prev_image_shortcut = None
+        self.next_image_shortcut = None
         
         self.init_ui()
     
@@ -2202,7 +2204,64 @@ class AnnotatePage(QWidget):
         # 底部状态栏
         self.status_bar = self.create_status_bar()
         self.main_layout.addWidget(self.status_bar)
-    
+
+        self._init_navigation_shortcuts()
+
+    def showEvent(self, event):
+        """显示页面时刷新快捷键配置。"""
+        self._refresh_navigation_shortcuts()
+        super().showEvent(event)
+
+    def _init_navigation_shortcuts(self):
+        """初始化翻页快捷键，避免依赖控件焦点。"""
+        self.prev_image_shortcut = QShortcut(QKeySequence(), self)
+        self.prev_image_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.prev_image_shortcut.activated.connect(self._trigger_prev_image_shortcut)
+
+        self.next_image_shortcut = QShortcut(QKeySequence(), self)
+        self.next_image_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.next_image_shortcut.activated.connect(self._trigger_next_image_shortcut)
+
+        self._refresh_navigation_shortcuts()
+
+    def _refresh_navigation_shortcuts(self):
+        """读取设置中的翻页快捷键。"""
+        from PyQt6.QtCore import QSettings
+
+        settings = QSettings("EzYOLO", "Settings")
+        prev_image_key = str(settings.value("prev_image_shortcut", "A")).upper()
+        next_image_key = str(settings.value("next_image_shortcut", "D")).upper()
+        self.prev_image_shortcut.setKey(QKeySequence(prev_image_key))
+        self.next_image_shortcut.setKey(QKeySequence(next_image_key))
+
+    def _should_handle_navigation_shortcut(self) -> bool:
+        """在当前焦点状态下是否允许触发翻页快捷键。"""
+        if QApplication.activeWindow() is not self.window():
+            return False
+        if QApplication.activePopupWidget() is not None:
+            return False
+
+        focus_widget = QApplication.focusWidget()
+        if focus_widget is None:
+            return True
+
+        if isinstance(focus_widget, (QLineEdit, QTextEdit, QAbstractSpinBox)):
+            return False
+        if focus_widget.inherits("QPlainTextEdit"):
+            return False
+
+        return True
+
+    def _trigger_prev_image_shortcut(self):
+        """上一张快捷键入口。"""
+        if self._should_handle_navigation_shortcut():
+            self.prev_image()
+
+    def _trigger_next_image_shortcut(self):
+        """下一张快捷键入口。"""
+        if self._should_handle_navigation_shortcut():
+            self.next_image()
+
     def create_left_panel(self) -> QWidget:
         """创建左侧面板 - 图片列表"""
         panel = QFrame()
@@ -4500,6 +4559,51 @@ class AnnotatePage(QWidget):
                 f"已随机删除 {deleted_count} 张“{target_name}”样本图"
             )
 
+    def _get_next_image_shortcut_key(self) -> str:
+        """获取当前“下一张”快捷键。"""
+        from PyQt6.QtCore import QSettings
+
+        settings = QSettings("EzYOLO", "Settings")
+        return str(settings.value("next_image_shortcut", "D")).upper()
+
+    def _exec_message_box_with_shortcut(
+        self,
+        *,
+        icon,
+        title: str,
+        text: str,
+        buttons,
+        default_button=None,
+        shortcut_button=None,
+        shortcut_key: Optional[str] = None,
+    ) -> Tuple[QMessageBox.StandardButton, bool]:
+        """执行消息框，并允许指定快捷键触发某个按钮。"""
+        message_box = QMessageBox(self)
+        message_box.setIcon(icon)
+        message_box.setWindowTitle(title)
+        message_box.setText(text)
+        message_box.setStandardButtons(buttons)
+        if default_button is not None:
+            message_box.setDefaultButton(default_button)
+
+        shortcut_triggered = False
+        if shortcut_button is not None and shortcut_key:
+            target_button = message_box.button(shortcut_button)
+            if target_button is not None:
+                shortcut = QShortcut(QKeySequence(shortcut_key), message_box)
+                message_box._shortcut = shortcut
+                shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+
+                def on_shortcut_activated():
+                    nonlocal shortcut_triggered
+                    shortcut_triggered = True
+                    target_button.click()
+
+                shortcut.activated.connect(on_shortcut_activated)
+
+        result = QMessageBox.StandardButton(message_box.exec())
+        return result, shortcut_triggered
+
     def mark_current_image_as_negative_sample(self):
         """将当前图片标注为负样本"""
         if not self.current_project_id or not self.current_image_id:
@@ -4508,15 +4612,21 @@ class AnnotatePage(QWidget):
 
         existing_annotations = db.get_image_annotations(self.current_image_id)
         annotation_count = len(existing_annotations)
+        next_image_key = self._get_next_image_shortcut_key()
 
         if annotation_count > 0:
-            reply = QMessageBox.question(
-                self,
-                "确认标注为负样本",
-                f"当前图片已有 {annotation_count} 个标注。\n"
-                f"继续后会清空这些标注，并将当前图片标记为负样本。\n"
-                f"是否继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            reply, _ = self._exec_message_box_with_shortcut(
+                icon=QMessageBox.Icon.Question,
+                title="确认标注为负样本",
+                text=(
+                    f"当前图片已有 {annotation_count} 个标注。\n"
+                    f"继续后会清空这些标注，并将当前图片标记为负样本。\n"
+                    f"是否继续？\n\n"
+                    f"按 {next_image_key} 可直接确认"
+                ),
+                buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                shortcut_button=QMessageBox.StandardButton.Yes,
+                shortcut_key=next_image_key,
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
@@ -4531,7 +4641,17 @@ class AnnotatePage(QWidget):
         self.update_image_list_display()
         self.update_sample_control_panel()
 
-        QMessageBox.information(self, "完成", "当前图片已标注为负样本")
+        _, shortcut_triggered = self._exec_message_box_with_shortcut(
+            icon=QMessageBox.Icon.Information,
+            title="完成",
+            text=f"当前图片已标注为负样本。\n按 {next_image_key} 可确认并进入下一张。",
+            buttons=QMessageBox.StandardButton.Ok,
+            default_button=QMessageBox.StandardButton.Ok,
+            shortcut_button=QMessageBox.StandardButton.Ok,
+            shortcut_key=next_image_key,
+        )
+        if shortcut_triggered:
+            self.next_image()
     
     def show_class_context_menu(self, position):
         """显示类别右键菜单"""
@@ -4729,8 +4849,6 @@ class AnnotatePage(QWidget):
         rect_tool_key = settings.value("rect_tool_shortcut", "W").upper()
         poly_tool_key = settings.value("poly_tool_shortcut", "P").upper()
         move_tool_key = settings.value("move_tool_shortcut", "V").upper()
-        prev_image_key = settings.value("prev_image_shortcut", "A").upper()
-        next_image_key = settings.value("next_image_shortcut", "D").upper()
         delete_key = settings.value("delete_shortcut", "DELETE").upper()
         
         # 处理工具快捷键
@@ -4746,12 +4864,6 @@ class AnnotatePage(QWidget):
         elif key_text == move_tool_key:
             self.btn_move.setChecked(True)
             self.set_tool('move')
-            return
-        elif key_text == prev_image_key:
-            self.prev_image()
-            return
-        elif key_text == next_image_key:
-            self.next_image()
             return
         elif key_text == delete_key:
             self.delete_selected_annotation()
