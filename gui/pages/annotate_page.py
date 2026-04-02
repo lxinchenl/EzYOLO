@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QToolBar, QButtonGroup,
     QRadioButton, QSpinBox, QDoubleSpinBox, QFormLayout,
     QGroupBox, QCheckBox, QSlider, QTextEdit, QInputDialog,
-    QColorDialog, QDialog
+    QSizePolicy,
+    QColorDialog, QDialog, QApplication, QAbstractSpinBox
 )
 import math
 
@@ -21,7 +22,7 @@ from gui.pages.batch_process_dialog import BatchProcessDialog
 from core.auto_labeler import BatchLabelingManager
 from core.model_manager import ModelManager
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize, QPoint, QRect
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QKeyEvent, QMouseEvent, QWheelEvent, QAction, QIcon, QPen, QBrush
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QKeyEvent, QMouseEvent, QWheelEvent, QAction, QIcon, QPen, QBrush, QShortcut, QKeySequence
 import cv2
 import numpy as np
 from pathlib import Path
@@ -29,12 +30,14 @@ from typing import List, Dict, Optional, Tuple
 import os
 import gc
 import threading
+import random
 
 from gui.styles import COLORS
 from models.database import db
 from gui.widgets.loading_dialog import LoadingOverlay
 
 SAM3_DOWNLOAD_URL = "https://huggingface.co/1038lab/sam3/discussions/1"
+NEGATIVE_SAMPLE_CLASS_ID = -1
 
 
 class SAMModelManager:
@@ -376,6 +379,86 @@ class AnnotateImageLoadWorker(QThread):
         
         self.finished_loading.emit()
     
+    def stop(self):
+        self._is_running = False
+
+
+class RandomSampleDeleteWorker(QThread):
+    """随机删除样本工作线程"""
+
+    progress_updated = pyqtSignal(int, int, str)  # 当前进度, 总数, 文件名
+    delete_finished = pyqtSignal(object)  # 删除结果
+    delete_failed = pyqtSignal(str)
+
+    def __init__(self, project_id: int, target_class_id: int, delete_count: int, current_image_id: Optional[int]):
+        super().__init__()
+        self.project_id = project_id
+        self.target_class_id = target_class_id
+        self.delete_count = delete_count
+        self.current_image_id = current_image_id
+        self._is_running = True
+
+    def run(self):
+        try:
+            if self.target_class_id == NEGATIVE_SAMPLE_CLASS_ID:
+                candidate_images = db.get_negative_sample_images(self.project_id, annotated_only=True)
+            else:
+                candidate_images = db.get_project_images_by_class(self.project_id, self.target_class_id)
+
+            available_count = len(candidate_images)
+            total_count = min(self.delete_count, available_count)
+            if total_count <= 0:
+                self.delete_finished.emit({
+                    'deleted_count': 0,
+                    'failed_files': [],
+                    'current_image_deleted': False,
+                    'canceled': False,
+                    'available_count': available_count,
+                    'total_count': 0,
+                })
+                return
+
+            target_images = random.sample(candidate_images, total_count)
+            deleted_count = 0
+            failed_files = []
+            current_image_deleted = False
+
+            for index, image in enumerate(target_images, start=1):
+                if not self._is_running:
+                    self.delete_finished.emit({
+                        'deleted_count': deleted_count,
+                        'failed_files': failed_files,
+                        'current_image_deleted': current_image_deleted,
+                        'canceled': True,
+                        'available_count': available_count,
+                        'total_count': total_count,
+                    })
+                    return
+
+                filename = image.get('filename', str(image.get('id')))
+                self.progress_updated.emit(index - 1, total_count, filename)
+
+                if image['id'] == self.current_image_id:
+                    current_image_deleted = True
+
+                if db.delete_image(image['id']):
+                    deleted_count += 1
+                else:
+                    failed_files.append(filename)
+
+                self.progress_updated.emit(index, total_count, filename)
+
+            self.delete_finished.emit({
+                'deleted_count': deleted_count,
+                'failed_files': failed_files,
+                'current_image_deleted': current_image_deleted,
+                'canceled': False,
+                'available_count': available_count,
+                'total_count': total_count,
+            })
+        except Exception as e:
+            self.delete_failed.emit(str(e))
+
     def stop(self):
         self._is_running = False
 
@@ -2160,6 +2243,12 @@ class AnnotatePage(QWidget):
         self.history = []  # 撤销历史
         self.history_index = -1
         self.load_worker = None  # 加载线程
+        self.random_delete_worker = None
+        self.random_delete_progress = None
+        self._sample_stats_project_id = None
+        self._sample_class_counts_cache = {}
+        self._negative_sample_count_cache = 0
+        self._sample_stats_dirty = True
         
         # 自动标注相关属性
         self.auto_label_dialog = None
@@ -2167,6 +2256,8 @@ class AnnotatePage(QWidget):
         self.batch_labeling_manager = None
         self.sam_memory_objects = []
         self.sam_memory_dialog = None
+        self.prev_image_shortcut = None
+        self.next_image_shortcut = None
         
         self.init_ui()
     
@@ -2199,7 +2290,64 @@ class AnnotatePage(QWidget):
         # 底部状态栏
         self.status_bar = self.create_status_bar()
         self.main_layout.addWidget(self.status_bar)
-    
+
+        self._init_navigation_shortcuts()
+
+    def showEvent(self, event):
+        """显示页面时刷新快捷键配置。"""
+        self._refresh_navigation_shortcuts()
+        super().showEvent(event)
+
+    def _init_navigation_shortcuts(self):
+        """初始化翻页快捷键，避免依赖控件焦点。"""
+        self.prev_image_shortcut = QShortcut(QKeySequence(), self)
+        self.prev_image_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.prev_image_shortcut.activated.connect(self._trigger_prev_image_shortcut)
+
+        self.next_image_shortcut = QShortcut(QKeySequence(), self)
+        self.next_image_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.next_image_shortcut.activated.connect(self._trigger_next_image_shortcut)
+
+        self._refresh_navigation_shortcuts()
+
+    def _refresh_navigation_shortcuts(self):
+        """读取设置中的翻页快捷键。"""
+        from PyQt6.QtCore import QSettings
+
+        settings = QSettings("EzYOLO", "Settings")
+        prev_image_key = str(settings.value("prev_image_shortcut", "A")).upper()
+        next_image_key = str(settings.value("next_image_shortcut", "D")).upper()
+        self.prev_image_shortcut.setKey(QKeySequence(prev_image_key))
+        self.next_image_shortcut.setKey(QKeySequence(next_image_key))
+
+    def _should_handle_navigation_shortcut(self) -> bool:
+        """在当前焦点状态下是否允许触发翻页快捷键。"""
+        if QApplication.activeWindow() is not self.window():
+            return False
+        if QApplication.activePopupWidget() is not None:
+            return False
+
+        focus_widget = QApplication.focusWidget()
+        if focus_widget is None:
+            return True
+
+        if isinstance(focus_widget, (QLineEdit, QTextEdit, QAbstractSpinBox)):
+            return False
+        if focus_widget.inherits("QPlainTextEdit"):
+            return False
+
+        return True
+
+    def _trigger_prev_image_shortcut(self):
+        """上一张快捷键入口。"""
+        if self._should_handle_navigation_shortcut():
+            self.prev_image()
+
+    def _trigger_next_image_shortcut(self):
+        """下一张快捷键入口。"""
+        if self._should_handle_navigation_shortcut():
+            self.next_image()
+
     def create_left_panel(self) -> QWidget:
         """创建左侧面板 - 图片列表"""
         panel = QFrame()
@@ -2553,83 +2701,121 @@ class AnnotatePage(QWidget):
                 border: 1px solid {COLORS['border']};
             }}
             QListWidget::item {{
-                padding: 4px;
+                padding: 6px 8px;
+                min-height: 24px;
             }}
             QListWidget::item:selected {{
                 background-color: {COLORS['primary']};
             }}
         """)
+        self.class_list.setSpacing(2)
         self.class_list.itemClicked.connect(self.on_class_selected)
         self.class_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.class_list.customContextMenuRequested.connect(self.show_class_context_menu)
         class_layout.addWidget(self.class_list)
         
+        compact_action_button_height = 24
+        compact_action_button_style = f"""
+            QPushButton {{
+                min-height: {compact_action_button_height}px;
+                max-height: {compact_action_button_height}px;
+                padding: 0 10px;
+            }}
+        """
+
         # 添加类别按钮
         self.btn_add_class = QPushButton("+ 添加类别")
         self.btn_add_class.clicked.connect(self.add_class)
-        class_layout.addWidget(self.btn_add_class)
+        self.btn_add_class.setFixedHeight(compact_action_button_height)
+        self.btn_add_class.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.btn_add_class.setStyleSheet(compact_action_button_style)
+        self.btn_apply_attr = QPushButton("应用修改")
+        self.btn_apply_attr.clicked.connect(self.apply_annotation_changes)
+        self.btn_apply_attr.setFixedHeight(compact_action_button_height)
+        self.btn_apply_attr.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.btn_apply_attr.setStyleSheet(compact_action_button_style)
+        self.btn_apply_attr.setEnabled(False)
+        class_button_row = QHBoxLayout()
+        class_button_row.setContentsMargins(0, 0, 0, 0)
+        class_button_row.setSpacing(8)
+        class_button_row.addWidget(self.btn_add_class, 1)
+        class_button_row.addWidget(self.btn_apply_attr, 1)
+        class_layout.addLayout(class_button_row)
         
         layout.addWidget(class_group)
         
-        # 标注属性
+        # 标注属性 / 样本调节
         attr_group = QGroupBox("标注属性")
         attr_group.setStyleSheet(class_group.styleSheet())
         attr_layout = QFormLayout(attr_group)
-        
-        # 位置信息
-        self.attr_x = QSpinBox()
-        self.attr_x.setRange(0, 10000)
-        self.attr_x.valueChanged.connect(self.on_attr_value_changed)
-        attr_layout.addRow("X:", self.attr_x)
-        
-        self.attr_y = QSpinBox()
-        self.attr_y.setRange(0, 10000)
-        self.attr_y.valueChanged.connect(self.on_attr_value_changed)
-        attr_layout.addRow("Y:", self.attr_y)
-        
-        self.attr_width = QSpinBox()
-        self.attr_width.setRange(0, 10000)
-        self.attr_width.valueChanged.connect(self.on_attr_value_changed)
-        attr_layout.addRow("宽度:", self.attr_width)
-        
-        self.attr_height = QSpinBox()
-        self.attr_height.setRange(0, 10000)
-        self.attr_height.valueChanged.connect(self.on_attr_value_changed)
-        attr_layout.addRow("高度:", self.attr_height)
-        
-        # 类别选择
+        attr_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        attr_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        attr_layout.setVerticalSpacing(8)
+        attr_layout.setHorizontalSpacing(10)
+
+        field_style = f"""
+            QComboBox, QSpinBox {{
+                min-height: 32px;
+                padding: 3px 8px;
+                color: {COLORS['text_primary']};
+            }}
+        """
+        # 当前标注类别
         self.attr_class = QComboBox()
         self.attr_class.currentIndexChanged.connect(self.on_attr_class_changed)
-        attr_layout.addRow("类别:", self.attr_class)
+        self.attr_class.hide()
         
-        # 应用按钮
-        self.btn_apply_attr = QPushButton("应用修改")
-        self.btn_apply_attr.clicked.connect(self.apply_annotation_changes)
-        attr_layout.addRow(self.btn_apply_attr)
+        # 当前目标标签的样本数
+        self.sample_target_class = QComboBox()
+        self.sample_target_class.currentIndexChanged.connect(self.on_sample_target_changed)
+        self.sample_target_class.setStyleSheet(field_style)
+        attr_layout.addRow("删样标签:", self.sample_target_class)
+
+        self.sample_count_label = QLabel("0")
+        self.sample_count_label.setMinimumHeight(32)
+        self.sample_count_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.sample_count_label.setStyleSheet(f"""
+            QLabel {{
+                color: {COLORS['text_primary']};
+                padding: 6px 8px;
+                border: 1px solid {COLORS['border']};
+                background-color: {COLORS['sidebar']};
+                border-radius: 4px;
+            }}
+        """)
+        attr_layout.addRow("标签个数:", self.sample_count_label)
+
+        self.sample_delete_count = QSpinBox()
+        self.sample_delete_count.setRange(0, 0)
+        self.sample_delete_count.setStyleSheet(field_style)
+        attr_layout.addRow("随机删去:", self.sample_delete_count)
+
+        self.sample_hint = QLabel("按整张图片随机删除；负样本指已标注但无任何框的图片。")
+        self.sample_hint.setWordWrap(True)
+        self.sample_hint.setStyleSheet(f"color: {COLORS['text_secondary']}; padding: 2px 0;")
+        attr_layout.addRow(self.sample_hint)
+
+        self.btn_mark_negative_sample = QPushButton("标注为负样本")
+        self.btn_mark_negative_sample.clicked.connect(self.mark_current_image_as_negative_sample)
+        self.btn_mark_negative_sample.setFixedHeight(compact_action_button_height)
+        self.btn_mark_negative_sample.setStyleSheet(compact_action_button_style)
+        self.btn_mark_negative_sample.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self.btn_delete_random_samples = QPushButton("随机删除样本")
+        self.btn_delete_random_samples.clicked.connect(self.delete_random_samples_for_target)
+        self.btn_delete_random_samples.setFixedHeight(compact_action_button_height)
+        self.btn_delete_random_samples.setStyleSheet(compact_action_button_style)
+        self.btn_delete_random_samples.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        action_button_widget = QWidget()
+        action_button_layout = QHBoxLayout(action_button_widget)
+        action_button_layout.setContentsMargins(0, 0, 0, 0)
+        action_button_layout.setSpacing(8)
+        action_button_layout.addWidget(self.btn_mark_negative_sample, 1)
+        action_button_layout.addWidget(self.btn_delete_random_samples, 1)
+        attr_layout.addRow(action_button_widget)
         
         layout.addWidget(attr_group)
-        
-        # 快捷键说明
-        shortcut_group = QGroupBox("快捷键")
-        shortcut_group.setStyleSheet(class_group.styleSheet())
-        shortcut_layout = QVBoxLayout(shortcut_group)
-        
-        shortcuts_text = """
-W - 矩形工具
-P - 多边形工具
-V - 移动工具
-D - 删除选中
-Ctrl+Z - 撤销
-Ctrl+Y - 重做
-方向键 - 切换图片
-Delete - 删除
-Esc - 取消操作
-        """
-        shortcuts_label = QLabel(shortcuts_text)
-        shortcuts_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
-        shortcut_layout.addWidget(shortcuts_label)
-        
-        layout.addWidget(shortcut_group)
         
         # 导出功能
         export_group = QGroupBox("数据导出")
@@ -2734,6 +2920,7 @@ Esc - 取消操作
         """设置当前项目"""
         # 即使项目ID相同，也重新加载数据（确保图片列表更新）
         self.current_project_id = project_id
+        self._invalidate_sample_stats_cache()
         
         # 显示加载动画
         self.loading_overlay = LoadingOverlay(self, "正在加载项目数据...")
@@ -2838,6 +3025,7 @@ Esc - 取消操作
         
         # 从数据库获取图片列表（很快）
         self.images = db.get_project_images(self.current_project_id)
+        self._invalidate_sample_stats_cache()
         
         # 先创建所有列表项（显示占位符）
         for image in self.images:
@@ -2851,6 +3039,7 @@ Esc - 取消操作
             self.image_list.addItem(item)
         
         self.update_status_bar()
+        self.update_sample_control_panel()
         
         # 启动后台加载线程加载缩略图
         if self.images:
@@ -2890,8 +3079,14 @@ Esc - 取消操作
     
     def update_class_list(self):
         """更新类别列表"""
+        current_attr_class = self.attr_class.currentData()
+        current_sample_target = self.sample_target_class.currentData()
+        current_selected_class = self.current_class_id
+        class_sample_counts, negative_sample_count = self._get_sample_stats()
         self.class_list.clear()
         self.attr_class.clear()
+        self.sample_target_class.blockSignals(True)
+        self.sample_target_class.clear()
         
         # 更新canvas的类别颜色
         class_colors = {}
@@ -2900,23 +3095,204 @@ Esc - 取消操作
         self.canvas.class_colors = class_colors
         
         for cls in self.classes:
+            sample_count = class_sample_counts.get(cls['id'], 0)
             # 创建带颜色的列表项
-            item = QListWidgetItem(f"■ {cls['name']}")
+            item = QListWidgetItem(f"■ {cls['name']} ({sample_count})")
             item.setData(Qt.ItemDataRole.UserRole, cls['id'])
             
             # 设置颜色
             color = QColor(cls.get('color', '#808080'))
             item.setForeground(color)
+            item.setSizeHint(QSize(item.sizeHint().width(), 30))
             
             self.class_list.addItem(item)
             
             # 添加到属性面板的下拉框
             self.attr_class.addItem(cls['name'], cls['id'])
+            self.sample_target_class.addItem(cls['name'], cls['id'])
+
+        self.sample_target_class.addItem("负样本", NEGATIVE_SAMPLE_CLASS_ID)
+
+        if current_attr_class is not None:
+            attr_index = self.attr_class.findData(current_attr_class)
+            if attr_index >= 0:
+                self.attr_class.setCurrentIndex(attr_index)
+
+        if current_sample_target is None:
+            current_sample_target = self.current_class_id if self.classes else NEGATIVE_SAMPLE_CLASS_ID
+        sample_index = self.sample_target_class.findData(current_sample_target)
+        if sample_index >= 0:
+            self.sample_target_class.setCurrentIndex(sample_index)
+        elif self.sample_target_class.count() > 0:
+            self.sample_target_class.setCurrentIndex(0)
+        self.sample_target_class.blockSignals(False)
+        self.update_sample_control_panel(class_sample_counts, negative_sample_count)
         
         # 默认选中第一个类别
         if self.class_list.count() > 0:
-            self.class_list.setCurrentRow(0)
+            selected_row = next(
+                (row for row in range(self.class_list.count())
+                 if self.class_list.item(row).data(Qt.ItemDataRole.UserRole) == current_selected_class),
+                0
+            )
+            self.class_list.setCurrentRow(selected_row)
             self.on_class_selected()
+
+    def get_sample_target_images(self, target_class_id):
+        """获取指定标签对应的样本图像列表"""
+        if not self.current_project_id or target_class_id is None:
+            return []
+
+        if target_class_id == NEGATIVE_SAMPLE_CLASS_ID:
+            return db.get_negative_sample_images(self.current_project_id, annotated_only=True)
+
+        return db.get_project_images_by_class(self.current_project_id, target_class_id)
+
+    def _invalidate_sample_stats_cache(self):
+        """标记样本统计缓存失效。"""
+        self._sample_stats_dirty = True
+
+    def _get_sample_stats(self, force_refresh=False):
+        """获取当前项目样本统计缓存。"""
+        if not self.current_project_id:
+            self._sample_stats_project_id = None
+            self._sample_class_counts_cache = {}
+            self._negative_sample_count_cache = 0
+            self._sample_stats_dirty = False
+            return {}, 0
+
+        should_refresh = (
+            force_refresh
+            or self._sample_stats_dirty
+            or self._sample_stats_project_id != self.current_project_id
+        )
+        if should_refresh:
+            self._sample_class_counts_cache = db.get_project_image_counts_by_class(self.current_project_id)
+            self._negative_sample_count_cache = db.get_negative_sample_image_count(
+                self.current_project_id,
+                annotated_only=True
+            )
+            self._sample_stats_project_id = self.current_project_id
+            self._sample_stats_dirty = False
+
+        return self._sample_class_counts_cache, self._negative_sample_count_cache
+
+    def get_project_sample_counts(self, force_refresh=False):
+        """获取当前项目各类别对应的样本图数量。"""
+        return self._get_sample_stats(force_refresh=force_refresh)[0]
+
+    def get_negative_sample_count(self, force_refresh=False):
+        """获取当前项目负样本图数量。"""
+        return self._get_sample_stats(force_refresh=force_refresh)[1]
+
+    def get_class_sample_count(self, class_id):
+        """获取某个类别对应的样本图数量"""
+        return self.get_project_sample_counts().get(class_id, 0)
+
+    def _get_selected_class_list_id(self) -> Optional[int]:
+        """获取类别列表当前选中的类别ID。"""
+        current_item = self.class_list.currentItem()
+        if current_item is None:
+            return None
+        return current_item.data(Qt.ItemDataRole.UserRole)
+
+    def _set_class_list_selection(self, class_id: Optional[int]):
+        """按类别ID同步类别列表选中状态。"""
+        if class_id is None:
+            self.class_list.clearSelection()
+            self._refresh_annotation_class_controls()
+            return
+
+        for row in range(self.class_list.count()):
+            item = self.class_list.item(row)
+            if item and item.data(Qt.ItemDataRole.UserRole) == class_id:
+                self.class_list.setCurrentRow(row)
+                self.current_class_id = class_id
+                self.canvas.current_class_id = class_id
+                break
+
+        self._sync_attr_class_combo_from_list()
+        self._refresh_annotation_class_controls()
+
+    def _sync_attr_class_combo_from_list(self):
+        """将类别列表当前选择同步到属性下拉框。"""
+        class_id = self._get_selected_class_list_id()
+        self.attr_class.blockSignals(True)
+        if class_id is None:
+            self.attr_class.setCurrentIndex(-1)
+        else:
+            index = self.attr_class.findData(class_id)
+            if index >= 0:
+                self.attr_class.setCurrentIndex(index)
+        self.attr_class.blockSignals(False)
+
+    def _refresh_annotation_class_controls(self):
+        """根据当前标注和类别选择刷新“应用修改”按钮状态。"""
+        selected_annotation_id = self.canvas.selected_annotation_id
+        if selected_annotation_id is None:
+            self.btn_apply_attr.setEnabled(False)
+            return
+
+        annotation = next((ann for ann in self.annotations if ann['id'] == selected_annotation_id), None)
+        if annotation is None:
+            self.btn_apply_attr.setEnabled(False)
+            return
+
+        selected_class_id = self._get_selected_class_list_id()
+        self.btn_apply_attr.setEnabled(
+            selected_class_id is not None and selected_class_id != annotation.get('class_id')
+        )
+
+    def refresh_class_list_counts(self, class_sample_counts=None):
+        """刷新类别列表中的样本数量显示"""
+        if class_sample_counts is None:
+            class_sample_counts = self.get_project_sample_counts()
+
+        for row in range(self.class_list.count()):
+            item = self.class_list.item(row)
+            if not item:
+                continue
+            class_id = item.data(Qt.ItemDataRole.UserRole)
+            class_info = next((cls for cls in self.classes if cls['id'] == class_id), None)
+            if not class_info:
+                continue
+            sample_count = class_sample_counts.get(class_id, 0)
+            item.setText(f"■ {class_info['name']} ({sample_count})")
+
+    def update_sample_control_panel(self, class_sample_counts=None, negative_sample_count=None):
+        """刷新样本调节面板"""
+        if class_sample_counts is None or negative_sample_count is None:
+            cached_class_counts, cached_negative_sample_count = self._get_sample_stats()
+            if class_sample_counts is None:
+                class_sample_counts = cached_class_counts
+            if negative_sample_count is None:
+                negative_sample_count = cached_negative_sample_count
+
+        self.refresh_class_list_counts(class_sample_counts)
+        target_class_id = self.sample_target_class.currentData()
+        if target_class_id is None:
+            self.sample_count_label.setText("0")
+            self.sample_delete_count.blockSignals(True)
+            self.sample_delete_count.setRange(0, 0)
+            self.sample_delete_count.setValue(0)
+            self.sample_delete_count.blockSignals(False)
+            return
+
+        if target_class_id == NEGATIVE_SAMPLE_CLASS_ID:
+            sample_count = negative_sample_count
+        else:
+            sample_count = class_sample_counts.get(target_class_id, 0)
+        self.sample_count_label.setText(str(sample_count))
+
+        self.sample_delete_count.blockSignals(True)
+        self.sample_delete_count.setRange(0, sample_count)
+        if self.sample_delete_count.value() > sample_count:
+            self.sample_delete_count.setValue(sample_count)
+        self.sample_delete_count.blockSignals(False)
+
+    def on_sample_target_changed(self, index):
+        """删样目标切换事件"""
+        self.update_sample_control_panel()
     
     def init_auto_label_components(self):
         """初始化自动标注组件"""
@@ -3448,6 +3824,8 @@ Esc - 取消操作
             except Exception:
                 failed += 1
         self.load_annotations()
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
         QMessageBox.information(
             self,
             "批量记忆推理",
@@ -3606,7 +3984,15 @@ Esc - 取消操作
                             source_classes = config.get('source_classes', [])
                             target_class = config.get('target_class')
                             if annotation.get('class_id') in source_classes:
-                                db.update_annotation(annotation['id'], class_id=target_class)
+                                target_class_info = next(
+                                    (cls for cls in self.classes if cls['id'] == target_class),
+                                    None
+                                )
+                                db.update_annotation(
+                                    annotation['id'],
+                                    class_id=target_class,
+                                    class_name=target_class_info['name'] if target_class_info else None
+                                )
                                 modified_count += 1
                 
                 processed_count += 1
@@ -3621,8 +4007,10 @@ Esc - 取消操作
             )
             
             # 刷新当前图片的标注显示
+            self._invalidate_sample_stats_cache()
             if self.current_image_id:
                 self.load_annotations()
+            self.update_sample_control_panel()
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"批量处理出错: {str(e)}")
@@ -3979,6 +4367,8 @@ Esc - 取消操作
             self.annotations = db.get_image_annotations(self.current_image_id)
             self.canvas.set_annotations(self.annotations)
             self.update_status_bar()
+            self._invalidate_sample_stats_cache()
+            self.update_sample_control_panel()
     
     def update_status_bar(self):
         """更新状态栏"""
@@ -4005,6 +4395,8 @@ Esc - 取消操作
             self.current_class_id = current_item.data(Qt.ItemDataRole.UserRole)
             # 更新画布当前类别
             self.canvas.current_class_id = self.current_class_id
+            self._sync_attr_class_combo_from_list()
+        self._refresh_annotation_class_controls()
     
     def filter_images(self, filter_text: str):
         """筛选图片"""
@@ -4119,6 +4511,7 @@ Esc - 取消操作
         self.annotations = db.get_image_annotations(self.current_image_id)
         self.canvas.set_annotations(self.annotations)
         self.update_status_bar()
+        self._refresh_annotation_class_controls()
     
     def set_tool(self, tool: str):
         """设置工具"""
@@ -4165,6 +4558,8 @@ Esc - 取消操作
         
         # 更新图片列表显示
         self.update_image_list_display()
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
     
     def on_annotation_selected(self, annotation_id: int):
         """标注选中事件"""
@@ -4199,15 +4594,18 @@ Esc - 取消操作
         # 重新加载
         self.load_annotations()
         self.canvas.selected_annotation_id = None
-        self.clear_attribute_panel()
+        self.clear_attribute_panel(refresh_sample_panel=False)
         
         # 检查图片是否还有标注
-        remaining_annotations = db.get_image_annotations(self.current_image_id)
+        remaining_annotations = self.annotations
         if not remaining_annotations:
             # 如果没有标注了，更新状态为未标注
             db.update_image_status(self.current_image_id, 'pending')
             # 更新图片列表显示
             self.update_image_list_display()
+
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
     
     def delete_selected_annotation(self):
         """删除选中的标注"""
@@ -4216,72 +4614,21 @@ Esc - 取消操作
     
     def update_attribute_panel(self, annotation: dict):
         """更新属性面板"""
-        data = annotation.get('data', {})
-        ann_type = annotation.get('type', 'bbox')
-        
-        # 临时断开信号，避免循环触发
-        self.attr_x.blockSignals(True)
-        self.attr_y.blockSignals(True)
-        self.attr_width.blockSignals(True)
-        self.attr_height.blockSignals(True)
-        self.attr_class.blockSignals(True)
-        
-        if ann_type == 'bbox':
-            self.attr_x.setValue(int(data.get('x', 0)))
-            self.attr_y.setValue(int(data.get('y', 0)))
-            self.attr_width.setValue(int(data.get('width', 0)))
-            self.attr_height.setValue(int(data.get('height', 0)))
-        
         # 设置类别
         class_id = annotation.get('class_id', 0)
-        index = self.attr_class.findData(class_id)
-        if index >= 0:
-            self.attr_class.setCurrentIndex(index)
-        
-        # 恢复信号
-        self.attr_x.blockSignals(False)
-        self.attr_y.blockSignals(False)
-        self.attr_width.blockSignals(False)
-        self.attr_height.blockSignals(False)
-        self.attr_class.blockSignals(False)
+        self._set_class_list_selection(class_id)
     
-    def clear_attribute_panel(self):
+    def clear_attribute_panel(self, refresh_sample_panel=True):
         """清空属性面板"""
-        self.attr_x.blockSignals(True)
-        self.attr_y.blockSignals(True)
-        self.attr_width.blockSignals(True)
-        self.attr_height.blockSignals(True)
         self.attr_class.blockSignals(True)
-        
-        self.attr_x.setValue(0)
-        self.attr_y.setValue(0)
-        self.attr_width.setValue(0)
-        self.attr_height.setValue(0)
-        
-        self.attr_x.blockSignals(False)
-        self.attr_y.blockSignals(False)
-        self.attr_width.blockSignals(False)
-        self.attr_height.blockSignals(False)
+        self.attr_class.setCurrentIndex(-1)
         self.attr_class.blockSignals(False)
-    
-    def on_attr_value_changed(self):
-        """属性值改变事件 - 实时更新画布"""
-        if self.canvas.selected_annotation_id is None:
-            return
-        
-        annotation = next((ann for ann in self.annotations if ann['id'] == self.canvas.selected_annotation_id), None)
-        if not annotation:
-            return
-        
-        # 更新标注数据
-        data = annotation['data']
-        data['x'] = self.attr_x.value()
-        data['y'] = self.attr_y.value()
-        data['width'] = self.attr_width.value()
-        data['height'] = self.attr_height.value()
-        
-        # 刷新画布
-        self.canvas.update()
+        self.sample_delete_count.blockSignals(True)
+        self.sample_delete_count.setValue(0)
+        self.sample_delete_count.blockSignals(False)
+        if refresh_sample_panel:
+            self.update_sample_control_panel()
+        self._refresh_annotation_class_controls()
     
     def on_attr_class_changed(self, index):
         """属性类别改变事件"""
@@ -4295,11 +4642,13 @@ Esc - 取消操作
         class_id = self.attr_class.currentData()
         if class_id is not None:
             annotation['class_id'] = class_id
+            self._set_class_list_selection(class_id)
             self.canvas.update()
     
     def apply_annotation_changes(self):
         """应用标注修改到数据库"""
         if self.canvas.selected_annotation_id is None:
+            QMessageBox.warning(self, "提示", "请先选中一个标注再修改类别")
             return
         
         annotation = next((ann for ann in self.annotations if ann['id'] == self.canvas.selected_annotation_id), None)
@@ -4307,33 +4656,286 @@ Esc - 取消操作
             return
         
         # 获取新的类别信息
-        class_id = self.attr_class.currentData()
-        class_name = self.classes[class_id]['name'] if class_id < len(self.classes) else 'unknown'
-        
+        class_id = self._get_selected_class_list_id()
+        if class_id is None:
+            QMessageBox.warning(self, "提示", "当前没有可用类别")
+            return
+
+        class_info = next((cls for cls in self.classes if cls['id'] == class_id), None)
+        class_name = class_info['name'] if class_info else 'unknown'
+
+        if class_id == annotation.get('class_id'):
+            self._refresh_annotation_class_controls()
+            return
+
         # 更新标注数据
         annotation['class_id'] = class_id
         annotation['class_name'] = class_name
-        
+
         # 更新到数据库
-        # 先删除旧标注，再添加新标注（简化处理）
-        db.delete_annotation(annotation['id'])
-        new_id = db.add_annotation(
-            image_id=self.current_image_id,
-            project_id=self.current_project_id,
-            class_id=class_id,
-            class_name=class_name,
-            annotation_type=annotation['type'],
-            data=annotation['data']
-        )
-        
-        # 更新选中状态
-        annotation['id'] = new_id
-        self.canvas.selected_annotation_id = new_id
+        updated = db.update_annotation(annotation['id'], class_id=class_id, class_name=class_name)
+        if not updated:
+            QMessageBox.warning(self, "提示", "标注类别修改失败")
+            return
         
         # 刷新显示
         self.load_annotations()
+        self.canvas.selected_annotation_id = annotation['id']
+        updated_annotation = next((ann for ann in self.annotations if ann['id'] == annotation['id']), None)
+        if updated_annotation:
+            self.update_attribute_panel(updated_annotation)
+        self.canvas.update()
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
         
         QMessageBox.information(self, "成功", "标注修改已保存")
+
+    def delete_random_samples_for_target(self):
+        """按目标标签随机删除样本图像"""
+        if not self.current_project_id:
+            QMessageBox.warning(self, "提示", "请先选择一个项目")
+            return
+
+        if self.random_delete_worker and self.random_delete_worker.isRunning():
+            QMessageBox.warning(self, "提示", "随机删样任务仍在执行，请等待完成后再试")
+            return
+
+        target_class_id = self.sample_target_class.currentData()
+        target_name = self.sample_target_class.currentText()
+        delete_count = self.sample_delete_count.value()
+
+        if target_class_id is None:
+            QMessageBox.warning(self, "提示", "请先选择一个删样标签")
+            return
+
+        if delete_count <= 0:
+            QMessageBox.warning(self, "提示", "删样数量必须大于 0")
+            return
+
+        class_sample_counts, negative_sample_count = self._get_sample_stats()
+        if target_class_id == NEGATIVE_SAMPLE_CLASS_ID:
+            available_count = negative_sample_count
+        else:
+            available_count = class_sample_counts.get(target_class_id, 0)
+        if available_count == 0:
+            QMessageBox.warning(self, "提示", f"当前标签“{target_name}”没有可删除的样本")
+            return
+
+        delete_count = min(delete_count, available_count)
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"将随机删除 {delete_count} 张“{target_name}”样本图。\n"
+            f"这是删除整张图片及其标注，不是只删框，且不可撤销。\n"
+            f"是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        from PyQt6.QtWidgets import QProgressDialog
+
+        self.random_delete_progress = QProgressDialog(
+            f"正在准备删除“{target_name}”样本图...",
+            "取消",
+            0,
+            delete_count,
+            self
+        )
+        self.random_delete_progress.setWindowTitle("随机删除样本")
+        self.random_delete_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.random_delete_progress.setAutoClose(False)
+        self.random_delete_progress.setAutoReset(False)
+        self.random_delete_progress.setMinimumDuration(0)
+        self.random_delete_progress.setValue(0)
+
+        self.btn_delete_random_samples.setEnabled(False)
+        self.random_delete_worker = RandomSampleDeleteWorker(
+            self.current_project_id,
+            target_class_id,
+            delete_count,
+            self.current_image_id
+        )
+        self.random_delete_worker.progress_updated.connect(self.on_random_delete_progress)
+        self.random_delete_worker.delete_finished.connect(
+            lambda result, current_target_name=target_name: self.on_random_delete_finished(current_target_name, result)
+        )
+        self.random_delete_worker.delete_failed.connect(self.on_random_delete_failed)
+        self.random_delete_progress.canceled.connect(self.random_delete_worker.stop)
+        self.random_delete_worker.start()
+        self.random_delete_progress.show()
+
+    def on_random_delete_progress(self, current: int, total: int, filename: str):
+        """随机删样本进度回调"""
+        if not self.random_delete_progress:
+            return
+        self.random_delete_progress.setMaximum(max(total, 1))
+        self.random_delete_progress.setValue(current)
+        self.random_delete_progress.setLabelText(
+            f"正在删除样本图 ({current}/{total})：{filename}"
+        )
+
+    def _cleanup_random_delete_task(self):
+        """清理随机删样本任务状态"""
+        if self.random_delete_progress:
+            self.random_delete_progress.close()
+            self.random_delete_progress.deleteLater()
+            self.random_delete_progress = None
+        if self.random_delete_worker:
+            self.random_delete_worker.deleteLater()
+            self.random_delete_worker = None
+        self.btn_delete_random_samples.setEnabled(True)
+
+    def on_random_delete_finished(self, target_name: str, result: dict):
+        """随机删样本完成回调"""
+        self._cleanup_random_delete_task()
+        self._invalidate_sample_stats_cache()
+
+        deleted_count = result.get('deleted_count', 0)
+        failed_files = result.get('failed_files', [])
+        current_image_deleted = result.get('current_image_deleted', False)
+        canceled = result.get('canceled', False)
+        total_count = result.get('total_count', 0)
+
+        self.load_image_list()
+
+        remaining_images = self.images
+        if remaining_images:
+            remaining_ids = {image['id'] for image in remaining_images}
+            if current_image_deleted or self.current_image_id not in remaining_ids:
+                self.load_image(remaining_images[0]['id'])
+            elif self.current_image_id:
+                self.load_image(self.current_image_id)
+        else:
+            self.current_image_id = None
+            self.current_image_data = None
+            self.annotations = []
+            self.canvas.selected_annotation_id = None
+            self.canvas.set_annotations([])
+            self.canvas.load_image("")
+            self.clear_attribute_panel(refresh_sample_panel=False)
+            self.update_status_bar()
+
+        if canceled:
+            QMessageBox.information(
+                self,
+                "删除已取消",
+                f"随机删样已取消。\n已删除 {deleted_count}/{total_count} 张“{target_name}”样本图"
+            )
+            return
+
+        if failed_files:
+            QMessageBox.warning(
+                self,
+                "部分删除失败",
+                f"成功删除 {deleted_count} 张图片，失败 {len(failed_files)} 张。\n"
+                f"失败文件：{', '.join(failed_files[:5])}"
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "删除完成",
+                f"已随机删除 {deleted_count} 张“{target_name}”样本图"
+            )
+
+    def on_random_delete_failed(self, error_message: str):
+        """随机删样本失败回调"""
+        self._cleanup_random_delete_task()
+        QMessageBox.critical(self, "删除失败", f"随机删除样本出错: {error_message}")
+
+    def _get_next_image_shortcut_key(self) -> str:
+        """获取当前“下一张”快捷键。"""
+        from PyQt6.QtCore import QSettings
+
+        settings = QSettings("EzYOLO", "Settings")
+        return str(settings.value("next_image_shortcut", "D")).upper()
+
+    def _exec_message_box_with_shortcut(
+        self,
+        *,
+        icon,
+        title: str,
+        text: str,
+        buttons,
+        default_button=None,
+        shortcut_button=None,
+        shortcut_key: Optional[str] = None,
+    ) -> Tuple[QMessageBox.StandardButton, bool]:
+        """执行消息框，并允许指定快捷键触发某个按钮。"""
+        message_box = QMessageBox(self)
+        message_box.setIcon(icon)
+        message_box.setWindowTitle(title)
+        message_box.setText(text)
+        message_box.setStandardButtons(buttons)
+        if default_button is not None:
+            message_box.setDefaultButton(default_button)
+
+        shortcut_triggered = False
+        if shortcut_button is not None and shortcut_key:
+            target_button = message_box.button(shortcut_button)
+            if target_button is not None:
+                shortcut = QShortcut(QKeySequence(shortcut_key), message_box)
+                message_box._shortcut = shortcut
+                shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+
+                def on_shortcut_activated():
+                    nonlocal shortcut_triggered
+                    shortcut_triggered = True
+                    target_button.click()
+
+                shortcut.activated.connect(on_shortcut_activated)
+
+        result = QMessageBox.StandardButton(message_box.exec())
+        return result, shortcut_triggered
+
+    def mark_current_image_as_negative_sample(self):
+        """将当前图片标注为负样本"""
+        if not self.current_project_id or not self.current_image_id:
+            QMessageBox.warning(self, "提示", "请先选择一张图片")
+            return
+
+        existing_annotations = db.get_image_annotations(self.current_image_id)
+        annotation_count = len(existing_annotations)
+        next_image_key = self._get_next_image_shortcut_key()
+
+        if annotation_count > 0:
+            reply, _ = self._exec_message_box_with_shortcut(
+                icon=QMessageBox.Icon.Question,
+                title="确认标注为负样本",
+                text=(
+                    f"当前图片已有 {annotation_count} 个标注。\n"
+                    f"继续后会清空这些标注，并将当前图片标记为负样本。\n"
+                    f"是否继续？\n\n"
+                    f"按 {next_image_key} 可直接确认"
+                ),
+                buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                shortcut_button=QMessageBox.StandardButton.Yes,
+                shortcut_key=next_image_key,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        db.delete_image_annotations(self.current_image_id)
+        db.update_image_status(self.current_image_id, 'annotated')
+        self.current_image_data = db.get_image(self.current_image_id)
+
+        self.load_annotations()
+        self.canvas.selected_annotation_id = None
+        self.clear_attribute_panel(refresh_sample_panel=False)
+        self.update_image_list_display()
+        self.update_sample_control_panel()
+
+        _, shortcut_triggered = self._exec_message_box_with_shortcut(
+            icon=QMessageBox.Icon.Information,
+            title="完成",
+            text=f"当前图片已标注为负样本。\n按 {next_image_key} 可确认并进入下一张。",
+            buttons=QMessageBox.StandardButton.Ok,
+            default_button=QMessageBox.StandardButton.Ok,
+            shortcut_button=QMessageBox.StandardButton.Ok,
+            shortcut_key=next_image_key,
+        )
+        if shortcut_triggered:
+            self.next_image()
     
     def show_class_context_menu(self, position):
         """显示类别右键菜单"""
@@ -4420,6 +5022,7 @@ Esc - 取消操作
         db.update_project(self.current_project_id, classes=self.classes)
         
         # 更新显示
+        self._invalidate_sample_stats_cache()
         self.update_class_list()
         self.load_annotations()
     
@@ -4511,6 +5114,8 @@ Esc - 取消操作
         
         self.history_index -= 1
         self.load_annotations()
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
     
     def update_status_bar(self):
         """更新状态栏"""
@@ -4531,8 +5136,6 @@ Esc - 取消操作
         rect_tool_key = settings.value("rect_tool_shortcut", "W").upper()
         poly_tool_key = settings.value("poly_tool_shortcut", "P").upper()
         move_tool_key = settings.value("move_tool_shortcut", "V").upper()
-        prev_image_key = settings.value("prev_image_shortcut", "A").upper()
-        next_image_key = settings.value("next_image_shortcut", "D").upper()
         delete_key = settings.value("delete_shortcut", "DELETE").upper()
         
         # 处理工具快捷键
@@ -4548,12 +5151,6 @@ Esc - 取消操作
         elif key_text == move_tool_key:
             self.btn_move.setChecked(True)
             self.set_tool('move')
-            return
-        elif key_text == prev_image_key:
-            self.prev_image()
-            return
-        elif key_text == next_image_key:
-            self.next_image()
             return
         elif key_text == delete_key:
             self.delete_selected_annotation()
@@ -4969,6 +5566,8 @@ Esc - 取消操作
         # 重新加载标注
         self.load_annotations()
         self.update_image_list_display()
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
         
         QMessageBox.information(self, "完成", f"{message}\n已添加 {added_count} 个标注")
     
@@ -5189,6 +5788,8 @@ Esc - 取消操作
         # 重新加载标注
         self.load_annotations()
         self.update_image_list_display()
+        self._invalidate_sample_stats_cache()
+        self.update_sample_control_panel()
         
         QMessageBox.information(self, "完成", 
             f"批量推理完成!\n"
