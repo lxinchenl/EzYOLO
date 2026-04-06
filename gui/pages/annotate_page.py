@@ -8,10 +8,10 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QGridLayout, QFrame, QFileDialog, QProgressBar,
     QMenu, QMessageBox, QComboBox, QLineEdit, QSplitter,
-    QListWidget, QListWidgetItem, QToolBar, QButtonGroup,
+    QListWidget, QListWidgetItem, QButtonGroup,
     QRadioButton, QSpinBox, QDoubleSpinBox, QFormLayout,
     QGroupBox, QCheckBox, QSlider, QTextEdit, QInputDialog,
-    QSizePolicy,
+    QSizePolicy, QToolButton,
     QColorDialog, QDialog, QApplication, QAbstractSpinBox
 )
 import math
@@ -2249,6 +2249,7 @@ class AnnotatePage(QWidget):
         self._sample_class_counts_cache = {}
         self._negative_sample_count_cache = 0
         self._sample_stats_dirty = True
+        self.default_draw_tool = 'rectangle'
         
         # 自动标注相关属性
         self.auto_label_dialog = None
@@ -2284,6 +2285,9 @@ class AnnotatePage(QWidget):
         
         # 设置分割器比例
         splitter.setSizes([250, 700, 250])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
         
         self.main_layout.addWidget(splitter)
         
@@ -2424,6 +2428,7 @@ class AnnotatePage(QWidget):
     def create_center_panel(self) -> QWidget:
         """创建中间面板 - 标注画布"""
         panel = QWidget()
+        panel.setMinimumWidth(620)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
@@ -2446,43 +2451,47 @@ class AnnotatePage(QWidget):
         
         return panel
     
-    def create_toolbar(self) -> QToolBar:
+    def create_toolbar(self) -> QWidget:
         """创建工具栏"""
-        toolbar = QToolBar()
+        toolbar = QFrame()
         toolbar.setStyleSheet(f"""
-            QToolBar {{
+            QFrame {{
                 background-color: {COLORS['panel']};
                 border: 1px solid {COLORS['border']};
-                border-radius: 4px;
-                padding: 4px;
+                border-radius: 6px;
             }}
         """)
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(6, 3, 6, 3)
+        toolbar_layout.setSpacing(14)
+        base_tool_button_style = self._toolbar_chip_style('tool')
         
         # 工具按钮组
         self.tool_group = QButtonGroup(self)
         self.tool_group.setExclusive(True)
         
-        # 矩形工具
-        self.btn_rectangle = QPushButton("🟦 矩形")
-        self.btn_rectangle.setCheckable(True)
-        self.btn_rectangle.clicked.connect(lambda: self.set_tool('rectangle'))
-        toolbar.addWidget(self.btn_rectangle)
-        self.btn_rectangle.hide()  # 默认隐藏
-        self.tool_group.addButton(self.btn_rectangle)
-        
-        # 多边形工具
-        self.btn_polygon = QPushButton("🛑 多边形")
-        self.btn_polygon.setCheckable(True)
-        self.btn_polygon.clicked.connect(lambda: self.set_tool('polygon'))
-        toolbar.addWidget(self.btn_polygon)
-        self.btn_polygon.hide()  # 默认隐藏
-        self.tool_group.addButton(self.btn_polygon)
+        # 绘制工具（矩形/多边形合并）
+        self.btn_draw_tool = QToolButton()
+        self.btn_draw_tool.setCheckable(True)
+        self.btn_draw_tool.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.btn_draw_tool.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.btn_draw_tool.setStyleSheet(base_tool_button_style)
+        self.btn_draw_tool.clicked.connect(self.activate_default_draw_tool)
+        self.draw_tool_menu = QMenu(self)
+        self.action_draw_rectangle = self.draw_tool_menu.addAction("矩形")
+        self.action_draw_polygon = self.draw_tool_menu.addAction("多边形")
+        self.action_draw_rectangle.triggered.connect(lambda: self.select_draw_tool('rectangle'))
+        self.action_draw_polygon.triggered.connect(lambda: self.select_draw_tool('polygon'))
+        self.btn_draw_tool.setMenu(self.draw_tool_menu)
+        self.btn_draw_tool.hide()  # 默认隐藏
+        self.tool_group.addButton(self.btn_draw_tool)
         
         # 关键点工具
         self.btn_keypoint = QPushButton("📍 关键点")
+        self.btn_keypoint.setToolTip("关键点工具")
         self.btn_keypoint.setCheckable(True)
         self.btn_keypoint.clicked.connect(lambda: self.set_tool('keypoint'))
-        toolbar.addWidget(self.btn_keypoint)
+        self.btn_keypoint.setStyleSheet(base_tool_button_style)
         self.btn_keypoint.hide()  # 默认隐藏
         self.tool_group.addButton(self.btn_keypoint)
         
@@ -2496,129 +2505,230 @@ class AnnotatePage(QWidget):
         
         # 移动工具
         self.btn_move = QPushButton("✋ 移动")
+        self.btn_move.setToolTip("移动视图")
         self.btn_move.setCheckable(True)
         self.btn_move.clicked.connect(lambda: self.set_tool('move'))
-        toolbar.addWidget(self.btn_move)
+        self.btn_move.setStyleSheet(base_tool_button_style)
         self.tool_group.addButton(self.btn_move)
-        
-        toolbar.addSeparator()
-        
-        # 删除按钮
-        self.btn_delete = QPushButton("🗑️ 删除 (D)")
+
+        # 删除按钮（主动作删标注，下拉菜单删图片）
+        self.btn_delete = QToolButton()
+        self.btn_delete.setText("🗑️ 删除")
+        self.btn_delete.setToolTip("删除当前选中标注\n快捷键: D")
+        self.btn_delete.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.btn_delete.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.btn_delete.setStyleSheet(self._toolbar_chip_style('danger'))
         self.btn_delete.clicked.connect(self.delete_selected_annotation)
-        toolbar.addWidget(self.btn_delete)
+        self.delete_menu = QMenu(self)
+        self.action_delete_current_image = self.delete_menu.addAction("删除当前图片")
+        self.action_delete_current_image.triggered.connect(self.delete_current_image)
+        self.delete_menu.aboutToShow.connect(self.update_delete_menu_state)
+        self.btn_delete.setMenu(self.delete_menu)
         
         # 撤销按钮
-        self.btn_undo = QPushButton("↶ 撤销 (Ctrl+Z)")
+        self.btn_undo = QPushButton("↶ 撤销")
+        self.btn_undo.setToolTip("撤销上一步\n快捷键: Ctrl+Z")
         self.btn_undo.clicked.connect(self.undo)
-        toolbar.addWidget(self.btn_undo)
+        self.btn_undo.setStyleSheet(base_tool_button_style)
         
         # 自动标注按钮
-        toolbar.addSeparator()
         self.btn_auto_label = QPushButton("🤖 自动标注")
         self.btn_auto_label.setMenu(self.create_auto_label_menu())
-        # 美化按钮样式
-        primary_color = COLORS['primary']
-        self.btn_auto_label.setStyleSheet(
-            f"QPushButton {{"  
-            f"    background-color: {primary_color};" 
-            f"    color: white;" 
-            f"    border: none;" 
-            f"    border-radius: 4px;" 
-            f"    padding: 6px 12px;" 
-            f"    font-weight: bold;" 
-            f"}}" 
-            f"QPushButton:hover {{" 
-            f"    background-color: {primary_color};" 
-            f"}}" 
-            f"QPushButton::menu-indicator {{" 
-            f"    image: none;" 
-            f"    subcontrol-position: right center;" 
-            f"    subcontrol-origin: padding;" 
-            f"    width: 16px;" 
-            f"    height: 16px;" 
-            f"}}" 
-            f"QPushButton::menu-indicator::hover {{" 
-            f"    image: none;" 
-            f"}}"
-        )
-        toolbar.addWidget(self.btn_auto_label)
+        self.btn_auto_label.setStyleSheet(self._toolbar_chip_style('ai_blue'))
         
         # SAM自动标注按钮
-        toolbar.addSeparator()
         self.btn_sam = QPushButton("🎯 SAM")
         self.btn_sam.setToolTip("使用SAM进行交互式分割标注")
-        sam_btn_style = (
-            f"QPushButton {{"
-            f"    background-color: {COLORS['success']};"
-            f"    color: white;"
-            f"    border: none;"
-            f"    border-radius: 4px;"
-            f"    padding: 6px 12px;"
-            f"    font-weight: bold;"
-            f"}}"
-            f"QPushButton:hover {{"
-            f"    background-color: {COLORS['success']};"
-            f"}}"
-            f"QPushButton::menu-indicator {{"
-            f"    image: none;"
-            f"}}"
-            f"QPushButton::menu-indicator::hover {{"
-            f"    image: none;"
-            f"}}"
-        )
-        self.btn_sam.setStyleSheet(sam_btn_style)
-        toolbar.addWidget(self.btn_sam)
+        self.btn_sam.setStyleSheet(self._toolbar_chip_style('ai_green'))
         self.apply_sam_button_mode()
         
         # LLM自动标注按钮
-        toolbar.addSeparator()
         self.btn_llm_label = QPushButton("🧠 LLM")
         self.btn_llm_label.setToolTip("使用多模态大模型进行自动标注")
         self.btn_llm_label.setMenu(self.create_llm_menu())
-        llm_btn_style = (
-            f"QPushButton {{"
-            f"    background-color: {COLORS['warning']};"
-            f"    color: white;"
-            f"    border: none;"
-            f"    border-radius: 4px;"
-            f"    padding: 6px 12px;"
-            f"    font-weight: bold;"
-            f"}}"
-            f"QPushButton:hover {{"
-            f"    background-color: {COLORS['warning']};"
-            f"}}"
-            f"QPushButton::menu-indicator {{"
-            f"    image: none;"
-            f"}}"
-            f"QPushButton::menu-indicator::hover {{"
-            f"    image: none;"
-            f"}}"
-        )
-        self.btn_llm_label.setStyleSheet(llm_btn_style)
-        toolbar.addWidget(self.btn_llm_label)
+        self.btn_llm_label.setStyleSheet(self._toolbar_chip_style('ai_gold'))
         
         # 批量处理按钮
-        toolbar.addSeparator()
-        self.btn_batch_process = QPushButton("📋 批量处理")
+        self.btn_batch_process = QPushButton("📋 批处理")
         self.btn_batch_process.clicked.connect(self.show_batch_process_dialog)
-        self.btn_batch_process.setStyleSheet(
-            f"QPushButton {{"  
-            f"    background-color: {COLORS['secondary']};" 
-            f"    color: white;" 
-            f"    border: none;" 
-            f"    border-radius: 4px;" 
-            f"    padding: 6px 12px;" 
-            f"    font-weight: bold;" 
-            f"}}" 
-            f"QPushButton:hover {{" 
-            f"    background-color: {COLORS['secondary']};" 
-            f"}}"
-        )
-        toolbar.addWidget(self.btn_batch_process)
+        self.btn_batch_process.setToolTip("批量处理工具")
+        self.btn_batch_process.setStyleSheet(self._toolbar_chip_style('ai_olive'))
+
+        self.toolbar_draw_buttons = [self.btn_draw_tool, self.btn_keypoint, self.btn_move]
+        self.toolbar_edit_buttons = [self.btn_delete, self.btn_undo]
+        self.toolbar_ai_buttons = [self.btn_auto_label, self.btn_sam, self.btn_llm_label, self.btn_batch_process]
+        self.toolbar_draw_group = self._create_toolbar_button_group(self.toolbar_draw_buttons)
+        self.toolbar_edit_group = self._create_toolbar_button_group(self.toolbar_edit_buttons)
+        self.toolbar_ai_group = self._create_toolbar_button_group(self.toolbar_ai_buttons)
+        self.toolbar_groups = [
+            (self.toolbar_draw_group, self.toolbar_draw_buttons),
+            (self.toolbar_edit_group, self.toolbar_edit_buttons),
+            (self.toolbar_ai_group, self.toolbar_ai_buttons),
+        ]
+
+        toolbar_layout.addWidget(self.toolbar_draw_group)
+        toolbar_layout.addWidget(self.toolbar_edit_group)
+        toolbar_layout.addWidget(self.toolbar_ai_group)
+        toolbar_layout.addStretch(1)
+
+        self.refresh_draw_tool_button()
+        self.refresh_toolbar_button_layout()
         
         return toolbar
 
+    def _create_toolbar_button_group(self, buttons) -> QWidget:
+        """创建工具栏按钮组，显式控制组内间距。"""
+        group_widget = QWidget()
+        layout = QHBoxLayout(group_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        for button in buttons:
+            layout.addWidget(button)
+        return group_widget
+
+    def _toolbar_chip_style(self, role: str) -> str:
+        """生成顶部工具栏按钮样式。"""
+        palette_map = {
+            'tool': {
+                'bg': '#154B78',
+                'hover': '#1D629B',
+                'active': COLORS['primary'],
+                'border': '#2871A8',
+                'text': '#F7FBFF',
+            },
+            'danger': {
+                'bg': '#154B78',
+                'hover': '#1D629B',
+                'active': COLORS['primary'],
+                'border': '#2871A8',
+                'text': '#F7FBFF',
+            },
+            'ai_blue': {
+                'bg': '#154B78',
+                'hover': '#1D629B',
+                'active': COLORS['primary'],
+                'border': '#2871A8',
+                'text': '#F7FBFF',
+            },
+            'ai_green': {
+                'bg': '#154B78',
+                'hover': '#1D629B',
+                'active': COLORS['primary'],
+                'border': '#2871A8',
+                'text': '#F7FBFF',
+            },
+            'ai_gold': {
+                'bg': '#154B78',
+                'hover': '#1D629B',
+                'active': COLORS['primary'],
+                'border': '#2871A8',
+                'text': '#F7FBFF',
+            },
+            'ai_olive': {
+                'bg': '#154B78',
+                'hover': '#1D629B',
+                'active': COLORS['primary'],
+                'border': '#2871A8',
+                'text': '#F7FBFF',
+            },
+        }
+        palette = palette_map[role]
+        return f"""
+            QPushButton, QToolButton {{
+                background-color: {palette['bg']};
+                color: {palette['text']};
+                border: 1px solid {palette['border']};
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }}
+            QPushButton:hover, QToolButton:hover {{
+                background-color: {palette['hover']};
+                border-color: {palette['active']};
+            }}
+            QPushButton:checked, QToolButton:checked {{
+                background-color: {palette['active']};
+                color: white;
+                border-color: {palette['active']};
+            }}
+            QToolButton::menu-button {{
+                subcontrol-origin: padding;
+                subcontrol-position: right center;
+                width: 16px;
+                background-color: rgba(255, 255, 255, 0.08);
+                border-left: 1px solid rgba(255, 255, 255, 0.14);
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }}
+            QToolButton::menu-button:hover {{
+                background-color: rgba(255, 255, 255, 0.14);
+            }}
+        """
+
+    def _get_toolbar_button_width(self, button) -> int:
+        """计算按钮建议宽度，菜单按钮额外预留箭头空间。"""
+        text_width = button.fontMetrics().horizontalAdvance(button.text())
+        extra_padding = 40
+        if isinstance(button, QToolButton) and button.menu() is not None:
+            extra_padding += 18
+        return text_width + extra_padding
+
+    def refresh_toolbar_button_layout(self):
+        """按分组统一顶部按钮尺寸。"""
+        button_height = 32
+        for group_widget, group in getattr(self, 'toolbar_groups', []):
+            visible_buttons = [
+                button for button in group
+                if button is not None and not button.isHidden()
+            ]
+            group_widget.setVisible(bool(visible_buttons))
+            if not visible_buttons:
+                continue
+            group_width = max(self._get_toolbar_button_width(button) for button in visible_buttons)
+            for button in visible_buttons:
+                button.setFixedHeight(button_height)
+                button.setFixedWidth(group_width)
+
+    def refresh_draw_tool_button(self):
+        """刷新绘制工具按钮文本与选项状态。"""
+        if not hasattr(self, 'btn_draw_tool'):
+            return
+
+        if self.default_draw_tool == 'polygon':
+            self.btn_draw_tool.setText("🛑 绘制")
+            self.btn_draw_tool.setToolTip("当前默认绘制模式: 多边形\n点击主按钮直接进入多边形绘制")
+        else:
+            self.btn_draw_tool.setText("🟦 绘制")
+            self.btn_draw_tool.setToolTip("当前默认绘制模式: 矩形\n点击主按钮直接进入矩形绘制")
+
+        if hasattr(self, 'action_draw_rectangle'):
+            self.action_draw_rectangle.setCheckable(True)
+            self.action_draw_rectangle.setChecked(self.default_draw_tool == 'rectangle')
+        if hasattr(self, 'action_draw_polygon'):
+            self.action_draw_polygon.setCheckable(True)
+            self.action_draw_polygon.setChecked(self.default_draw_tool == 'polygon')
+
+        self.refresh_toolbar_button_layout()
+
+    def select_draw_tool(self, tool: str):
+        """选择默认绘制工具，并立即切换到该工具。"""
+        if tool not in ('rectangle', 'polygon'):
+            return
+        self.default_draw_tool = tool
+        self.refresh_draw_tool_button()
+        self.btn_draw_tool.setChecked(True)
+        self.set_tool(tool)
+
+    def activate_default_draw_tool(self):
+        """激活当前默认绘制工具。"""
+        self.btn_draw_tool.setChecked(True)
+        self.set_tool(self.default_draw_tool)
+
+    def update_delete_menu_state(self):
+        """更新删除菜单状态。"""
+        if hasattr(self, 'action_delete_current_image'):
+            self.action_delete_current_image.setEnabled(bool(self.current_image_id))
+    
     def apply_sam_button_mode(self):
         """根据SAM设置刷新按钮行为：普通模式/记忆模式。"""
         if not hasattr(self, "btn_sam"):
@@ -2641,6 +2751,7 @@ class AnnotatePage(QWidget):
             self.btn_sam.setText("🎯 SAM")
             self.btn_sam.setToolTip("使用SAM进行交互式分割标注")
             self.btn_sam.clicked.connect(self.start_sam_annotation)
+        self.refresh_toolbar_button_layout()
 
     def create_sam_memory_menu(self) -> QMenu:
         menu = QMenu(self)
@@ -4438,21 +4549,16 @@ class AnnotatePage(QWidget):
     def adjust_tool_visibility(self, task_type):
         """根据任务类型调整标注工具的显示"""
         # 隐藏所有标注工具
-        self.btn_rectangle.hide()
-        self.btn_polygon.hide()
+        self.btn_draw_tool.hide()
         self.btn_keypoint.hide()
         
         # 根据任务类型显示对应的工具
         if task_type == 'detect':
-            self.btn_rectangle.show()
-            # 默认选中矩形工具
-            self.btn_rectangle.setChecked(True)
-            self.set_tool('rectangle')
+            self.btn_draw_tool.show()
+            self.select_draw_tool('rectangle')
         elif task_type == 'segment':
-            self.btn_polygon.show()
-            # 默认选中多边形工具
-            self.btn_polygon.setChecked(True)
-            self.set_tool('polygon')
+            self.btn_draw_tool.show()
+            self.select_draw_tool('polygon')
         elif task_type == 'pose':
             self.btn_keypoint.show()
             # 默认选中关键点工具
@@ -4464,10 +4570,12 @@ class AnnotatePage(QWidget):
         
         # 移动工具始终显示
         self.btn_move.show()
+        self.refresh_toolbar_button_layout()
     
     def load_image(self, image_id: int):
         """加载图片"""
         self.current_image_id = image_id
+        self.update_delete_menu_state()
         
         # 找到图片数据
         image_data = next((img for img in self.images if img['id'] == image_id), None)
@@ -4516,6 +4624,16 @@ class AnnotatePage(QWidget):
     def set_tool(self, tool: str):
         """设置工具"""
         self.canvas.set_tool(tool)
+
+        if tool in ('rectangle', 'polygon'):
+            self.default_draw_tool = tool
+            if hasattr(self, 'btn_draw_tool'):
+                self.btn_draw_tool.setChecked(True)
+                self.refresh_draw_tool_button()
+        elif tool == 'keypoint' and hasattr(self, 'btn_keypoint'):
+            self.btn_keypoint.setChecked(True)
+        elif tool == 'move' and hasattr(self, 'btn_move'):
+            self.btn_move.setChecked(True)
         
         # 确保status_tool存在时才更新
         if hasattr(self, 'status_tool'):
@@ -4527,6 +4645,68 @@ class AnnotatePage(QWidget):
                 'obb': '旋转矩形'
             }
             self.status_tool.setText(f"工具: {tool_names.get(tool, tool)}")
+
+    def clear_current_image_view(self):
+        """清空当前图片显示与相关状态。"""
+        self.current_image_id = None
+        self.current_image_data = None
+        self.annotations = []
+        self.history = []
+        self.history_index = -1
+        self.canvas.selected_annotation_id = None
+        self.canvas.set_annotations([])
+        self.canvas.load_image("")
+        self.clear_attribute_panel(refresh_sample_panel=False)
+        self.update_status_bar()
+        self.update_delete_menu_state()
+
+    def delete_current_image(self):
+        """删除当前图片及其全部标注和实际文件。"""
+        if not self.current_project_id or not self.current_image_id:
+            QMessageBox.warning(self, "提示", "当前没有可删除的图片")
+            return
+
+        current_index = next(
+            (i for i, image in enumerate(self.images) if image['id'] == self.current_image_id),
+            -1
+        )
+        current_image = next(
+            (image for image in self.images if image['id'] == self.current_image_id),
+            None
+        )
+        if current_index < 0 or current_image is None:
+            QMessageBox.warning(self, "提示", "当前图片不存在或已失效，请先重新加载")
+            return
+
+        filename = current_image.get('filename', str(self.current_image_id))
+        reply = QMessageBox.question(
+            self,
+            "确认删除当前图片",
+            (
+                f"将删除当前图片“{filename}”及其全部标注，并删除实际文件。\n"
+                "此操作不可恢复，是否继续？"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        fallback_index = current_index if current_index < len(self.images) - 1 else current_index - 1
+        deleted = db.delete_image(self.current_image_id)
+        if not deleted:
+            QMessageBox.warning(self, "提示", "删除当前图片失败")
+            return
+
+        self.load_image_list()
+        self.update_class_list()
+
+        if self.images:
+            fallback_index = max(0, min(fallback_index, len(self.images) - 1))
+            next_image_id = self.images[fallback_index]['id']
+            self.load_image(next_image_id)
+        else:
+            self.clear_current_image_view()
     
     def on_annotation_created(self, annotation: dict):
         """标注创建事件"""
@@ -4807,14 +4987,7 @@ class AnnotatePage(QWidget):
             elif self.current_image_id:
                 self.load_image(self.current_image_id)
         else:
-            self.current_image_id = None
-            self.current_image_data = None
-            self.annotations = []
-            self.canvas.selected_annotation_id = None
-            self.canvas.set_annotations([])
-            self.canvas.load_image("")
-            self.clear_attribute_panel(refresh_sample_panel=False)
-            self.update_status_bar()
+            self.clear_current_image_view()
 
         if canceled:
             QMessageBox.information(
@@ -5126,6 +5299,14 @@ class AnnotatePage(QWidget):
         
         self.status_image.setText(f"当前: {current}/{total}")
         self.status_annotation.setText(f"标注: {len(self.annotations)}")
+        tool_names = {
+            'rectangle': '矩形',
+            'polygon': '多边形',
+            'move': '移动',
+            'keypoint': '关键点',
+            'obb': '旋转矩形'
+        }
+        self.status_tool.setText(f"工具: {tool_names.get(self.canvas.current_tool, self.canvas.current_tool)}")
     
     def keyPressEvent(self, event: QKeyEvent):
         """键盘事件"""
@@ -5141,12 +5322,10 @@ class AnnotatePage(QWidget):
         # 处理工具快捷键
         key_text = event.text().upper()
         if key_text == rect_tool_key:
-            self.btn_rectangle.setChecked(True)
-            self.set_tool('rectangle')
+            self.select_draw_tool('rectangle')
             return
         elif key_text == poly_tool_key:
-            self.btn_polygon.setChecked(True)
-            self.set_tool('polygon')
+            self.select_draw_tool('polygon')
             return
         elif key_text == move_tool_key:
             self.btn_move.setChecked(True)
