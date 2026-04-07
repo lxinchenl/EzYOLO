@@ -5,9 +5,10 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QDoubleSpinBox, QGroupBox, QFormLayout,
     QCheckBox, QSlider, QProgressBar, QTextEdit, QSplitter,
-    QTabWidget, QFileDialog, QMessageBox, QScrollArea, QFrame
+    QTabWidget, QFileDialog, QMessageBox, QScrollArea, QFrame,
+    QInputDialog
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings
 import os
 import json
 import shutil
@@ -96,6 +97,64 @@ SIZE_NAMES = {
     "b": "balanced (平衡)",
     "u": "ultra (超大)",
 }
+
+NO_TEMPLATE_OPTION = "不使用模板"
+
+
+class NoWheelSpinBox(QSpinBox):
+    """未聚焦时忽略滚轮，交给外层滚动区域处理。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """未聚焦时忽略滚轮，交给外层滚动区域处理。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoWheelComboBox(QComboBox):
+    """未聚焦时忽略滚轮，交给外层滚动区域处理。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoWheelSlider(QSlider):
+    """未聚焦时忽略滚轮，交给外层滚动区域处理。"""
+
+    def __init__(self, orientation, *args, **kwargs):
+        super().__init__(orientation, *args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
 
 
 class TrainingThread(QThread):
@@ -583,8 +642,11 @@ class TrainPage(QWidget):
         self.current_project_id = None
         self.training_thread = None
         self.training_history = []
+        self.settings = QSettings("EzYOLO", "Settings")
+        self.training_templates = {}
         
         self.init_ui()
+        self.load_training_templates()
     
     def set_project(self, project_id: int):
         """设置当前项目"""
@@ -655,6 +717,9 @@ class TrainPage(QWidget):
         title.setObjectName("title")
         title.setStyleSheet("font-size: 20px; font-weight: bold;")
         layout.addWidget(title)
+
+        template_bar = self.create_template_bar()
+        layout.addWidget(template_bar)
         
         # 创建滚动区域
         scroll = QScrollArea()
@@ -690,6 +755,50 @@ class TrainPage(QWidget):
         layout.addWidget(scroll)
         
         return panel
+
+    def create_template_bar(self) -> QWidget:
+        """创建训练模板工具条。"""
+        bar = QFrame()
+        bar.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['panel']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 6px;
+            }}
+        """)
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+        top_row.addWidget(QLabel("训练模板:"))
+
+        self.template_combo = NoWheelComboBox()
+        self.template_combo.currentTextChanged.connect(self.on_template_selection_changed)
+        top_row.addWidget(self.template_combo, 1)
+        layout.addLayout(top_row)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
+        self.btn_apply_template = QPushButton("套用模板")
+        self.btn_apply_template.clicked.connect(self.apply_selected_template)
+        button_row.addWidget(self.btn_apply_template)
+
+        self.btn_save_template = QPushButton("保存为模板")
+        self.btn_save_template.clicked.connect(self.save_current_as_template)
+        button_row.addWidget(self.btn_save_template)
+
+        self.btn_update_template = QPushButton("更新模板")
+        self.btn_update_template.clicked.connect(self.update_selected_template)
+        button_row.addWidget(self.btn_update_template)
+
+        self.btn_delete_template = QPushButton("删除模板")
+        self.btn_delete_template.clicked.connect(self.delete_selected_template)
+        button_row.addWidget(self.btn_delete_template)
+
+        layout.addLayout(button_row)
+        return bar
     
     def get_group_style(self) -> str:
         """获取分组框样式"""
@@ -717,17 +826,17 @@ class TrainPage(QWidget):
         layout.setSpacing(10)
         
         # YOLO版本选择
-        self.model_version = QComboBox()
+        self.model_version = NoWheelComboBox()
         self.model_version.addItems(sorted(ULTRALYTICS_MODELS.keys()))
         self.model_version.currentTextChanged.connect(self.on_version_changed)
         layout.addRow("版本:", self.model_version)
         
         # 模型型号选择
-        self.model_size = QComboBox()
+        self.model_size = NoWheelComboBox()
         layout.addRow("型号:", self.model_size)
         
         # 任务类型
-        self.task_type = QComboBox()
+        self.task_type = NoWheelComboBox()
         layout.addRow("任务:", self.task_type)
         
         # 立即初始化型号和任务列表
@@ -769,26 +878,26 @@ class TrainPage(QWidget):
         layout.setSpacing(10)
         
         # Epochs
-        self.epochs = QSpinBox()
+        self.epochs = NoWheelSpinBox()
         self.epochs.setRange(1, 1000)
         self.epochs.setValue(100)
         layout.addRow("Epochs:", self.epochs)
         
         # Batch Size
-        self.batch_size = QSpinBox()
+        self.batch_size = NoWheelSpinBox()
         self.batch_size.setRange(1, 128)
         self.batch_size.setValue(16)
         layout.addRow("Batch Size:", self.batch_size)
         
         # Image Size
-        self.img_size = QSpinBox()
+        self.img_size = NoWheelSpinBox()
         self.img_size.setRange(320, 1280)
         self.img_size.setValue(640)
         self.img_size.setSingleStep(32)
         layout.addRow("Image Size:", self.img_size)
         
         # Learning Rate
-        self.lr = QDoubleSpinBox()
+        self.lr = NoWheelDoubleSpinBox()
         self.lr.setRange(0.0001, 0.1)
         self.lr.setValue(0.01)
         self.lr.setDecimals(4)
@@ -796,17 +905,17 @@ class TrainPage(QWidget):
         layout.addRow("Learning Rate:", self.lr)
         
         # Optimizer
-        self.optimizer = QComboBox()
+        self.optimizer = NoWheelComboBox()
         self.optimizer.addItems(["SGD", "Adam", "AdamW", "LION"])
         layout.addRow("Optimizer:", self.optimizer)
         
         # Device
-        self.device = QComboBox()
+        self.device = NoWheelComboBox()
         self.device.addItems(["自动选择", "CPU", "CUDA:0", "CUDA:1", "CUDA:2", "CUDA:3"])
         layout.addRow("Device:", self.device)
         
         # Workers
-        self.workers = QSpinBox()
+        self.workers = NoWheelSpinBox()
         self.workers.setRange(0, 32)
         self.workers.setValue(4)
         self.workers.setSingleStep(1)
@@ -845,7 +954,7 @@ class TrainPage(QWidget):
         self.hsv = QCheckBox("HSV增强")
         self.hsv.setChecked(True)
         hsv_layout.addWidget(self.hsv)
-        self.hsv_strength = QSlider(Qt.Orientation.Horizontal)
+        self.hsv_strength = NoWheelSlider(Qt.Orientation.Horizontal)
         self.hsv_strength.setRange(0, 100)
         self.hsv_strength.setValue(50)
         hsv_layout.addWidget(self.hsv_strength)
@@ -862,7 +971,7 @@ class TrainPage(QWidget):
         layout.setSpacing(10)
         
         # 训练集比例
-        self.train_split = QSlider(Qt.Orientation.Horizontal)
+        self.train_split = NoWheelSlider(Qt.Orientation.Horizontal)
         self.train_split.setRange(50, 95)
         self.train_split.setValue(80)
         self.train_split.valueChanged.connect(self.on_split_changed)
@@ -873,7 +982,7 @@ class TrainPage(QWidget):
         layout.addRow("训练集:", split_layout)
         
         # 验证集比例
-        self.val_split = QSlider(Qt.Orientation.Horizontal)
+        self.val_split = NoWheelSlider(Qt.Orientation.Horizontal)
         self.val_split.setRange(5, 30)
         self.val_split.setValue(10)
         self.val_split.valueChanged.connect(self.on_split_changed)
@@ -884,7 +993,7 @@ class TrainPage(QWidget):
         layout.addRow("验证集:", split_layout)
         
         # 测试集比例
-        self.test_split = QSlider(Qt.Orientation.Horizontal)
+        self.test_split = NoWheelSlider(Qt.Orientation.Horizontal)
         self.test_split.setRange(0, 20)
         self.test_split.setValue(10)
         self.test_split.valueChanged.connect(self.on_split_changed)
@@ -973,6 +1082,271 @@ class TrainPage(QWidget):
         layout.addLayout(btn_layout)
         
         return group
+
+    def load_training_templates(self):
+        """加载全局训练模板。"""
+        raw_templates = self.settings.value("training_templates", "{}")
+        try:
+            templates = json.loads(raw_templates) if raw_templates else {}
+        except (TypeError, json.JSONDecodeError):
+            templates = {}
+
+        self.training_templates = templates if isinstance(templates, dict) else {}
+        selected_name = str(self.settings.value("training_selected_template", NO_TEMPLATE_OPTION))
+
+        self.template_combo.blockSignals(True)
+        self.template_combo.clear()
+        self.template_combo.addItem(NO_TEMPLATE_OPTION)
+        for template_name in sorted(self.training_templates.keys()):
+            self.template_combo.addItem(template_name)
+
+        if selected_name in self.training_templates:
+            self.template_combo.setCurrentText(selected_name)
+        else:
+            self.template_combo.setCurrentText(NO_TEMPLATE_OPTION)
+        self.template_combo.blockSignals(False)
+        self.refresh_template_ui_state()
+        self.save_training_templates()
+
+    def save_training_templates(self):
+        """保存全局训练模板。"""
+        self.settings.setValue(
+            "training_templates",
+            json.dumps(self.training_templates, ensure_ascii=False)
+        )
+        current_name = self.template_combo.currentText() if hasattr(self, "template_combo") else NO_TEMPLATE_OPTION
+        self.settings.setValue(
+            "training_selected_template",
+            current_name if current_name in self.training_templates else NO_TEMPLATE_OPTION
+        )
+
+    def on_template_selection_changed(self, _text: str):
+        """模板选择变化。"""
+        self.refresh_template_ui_state()
+        self.save_training_templates()
+
+    def refresh_template_ui_state(self):
+        """刷新模板相关按钮状态。"""
+        current_name = self.template_combo.currentText() if hasattr(self, "template_combo") else NO_TEMPLATE_OPTION
+        has_template = current_name in self.training_templates
+        self.btn_apply_template.setEnabled(has_template)
+        self.btn_update_template.setEnabled(has_template)
+        self.btn_delete_template.setEnabled(has_template)
+
+    def collect_training_form_config(self) -> dict:
+        """收集当前表单配置。"""
+        return {
+            'version': self.model_version.currentText(),
+            'model_size': self.model_size.currentData(),
+            'task': self.task_type.currentData(),
+            'epochs': self.epochs.value(),
+            'batch_size': self.batch_size.value(),
+            'img_size': self.img_size.value(),
+            'lr': self.lr.value(),
+            'optimizer': self.optimizer.currentText(),
+            'device': self.device.currentText(),
+            'workers': self.workers.value(),
+            'mosaic': self.mosaic.isChecked(),
+            'mixup': self.mixup.isChecked(),
+            'flip': self.flip.isChecked(),
+            'rotate': self.rotate.isChecked(),
+            'hsv': self.hsv.isChecked(),
+            'hsv_strength': self.hsv_strength.value(),
+            'train_split': self.train_split.value(),
+            'val_split': self.val_split.value(),
+            'test_split': self.test_split.value(),
+        }
+
+    def _set_combo_by_text(self, combo: QComboBox, value: str) -> bool:
+        index = combo.findText(value)
+        if index < 0:
+            return False
+        combo.setCurrentIndex(index)
+        return True
+
+    def _set_combo_by_data(self, combo: QComboBox, value: str) -> bool:
+        index = combo.findData(value)
+        if index < 0:
+            return False
+        combo.setCurrentIndex(index)
+        return True
+
+    def apply_training_form_config(self, config: dict) -> bool:
+        """将配置写回到训练页面表单。"""
+        version = config.get('version')
+        if version not in ULTRALYTICS_MODELS:
+            QMessageBox.warning(self, "模板无效", f"模板中的模型版本不可用: {version}")
+            return False
+
+        if not self._set_combo_by_text(self.model_version, version):
+            QMessageBox.warning(self, "模板无效", f"无法切换到模板中的模型版本: {version}")
+            return False
+        self.on_version_changed(version)
+
+        model_size = config.get('model_size')
+        task = config.get('task')
+        if not self._set_combo_by_data(self.model_size, model_size):
+            QMessageBox.warning(self, "模板无效", f"模板中的模型型号不可用: {model_size}")
+            return False
+        if not self._set_combo_by_data(self.task_type, task):
+            QMessageBox.warning(self, "模板无效", f"模板中的任务类型不可用: {task}")
+            return False
+
+        self.epochs.setValue(int(config.get('epochs', self.epochs.value())))
+        self.batch_size.setValue(int(config.get('batch_size', self.batch_size.value())))
+        self.img_size.setValue(int(config.get('img_size', self.img_size.value())))
+        self.lr.setValue(float(config.get('lr', self.lr.value())))
+        self._set_combo_by_text(self.optimizer, str(config.get('optimizer', self.optimizer.currentText())))
+        self._set_combo_by_text(self.device, str(config.get('device', self.device.currentText())))
+        self.workers.setValue(int(config.get('workers', self.workers.value())))
+
+        self.mosaic.setChecked(bool(config.get('mosaic', self.mosaic.isChecked())))
+        self.mixup.setChecked(bool(config.get('mixup', self.mixup.isChecked())))
+        self.flip.setChecked(bool(config.get('flip', self.flip.isChecked())))
+        self.rotate.setChecked(bool(config.get('rotate', self.rotate.isChecked())))
+        self.hsv.setChecked(bool(config.get('hsv', self.hsv.isChecked())))
+        self.hsv_strength.setValue(int(config.get('hsv_strength', self.hsv_strength.value())))
+
+        self.train_split.setValue(int(config.get('train_split', self.train_split.value())))
+        self.val_split.setValue(int(config.get('val_split', self.val_split.value())))
+        self.test_split.setValue(int(config.get('test_split', self.test_split.value())))
+        self.on_split_changed()
+        return True
+
+    def save_current_as_template(self):
+        """将当前页面配置保存为模板。"""
+        template_name, ok = QInputDialog.getText(self, "保存训练模板", "请输入模板名称:")
+        template_name = template_name.strip()
+        if not ok or not template_name:
+            return
+        if template_name == NO_TEMPLATE_OPTION:
+            QMessageBox.warning(self, "模板名称无效", f"“{NO_TEMPLATE_OPTION}”是保留名称，请换一个模板名")
+            return
+
+        if template_name in self.training_templates:
+            reply = QMessageBox.question(
+                self,
+                "覆盖模板",
+                f"模板“{template_name}”已存在，是否覆盖？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        self.training_templates[template_name] = self.collect_training_form_config()
+        self.save_training_templates()
+        self.load_training_templates()
+        self.template_combo.setCurrentText(template_name)
+
+    def update_selected_template(self):
+        """用当前页面参数覆盖当前模板。"""
+        template_name = self.template_combo.currentText()
+        if template_name not in self.training_templates:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "更新模板",
+            f"确认用当前页面参数覆盖模板“{template_name}”？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.training_templates[template_name] = self.collect_training_form_config()
+        self.save_training_templates()
+
+    def delete_selected_template(self):
+        """删除当前选中的模板。"""
+        template_name = self.template_combo.currentText()
+        if template_name not in self.training_templates:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "删除模板",
+            f"确认删除模板“{template_name}”？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.training_templates.pop(template_name, None)
+        self.save_training_templates()
+        self.load_training_templates()
+
+    def apply_selected_template(self):
+        """立即套用当前选中的模板。"""
+        template_name = self.template_combo.currentText()
+        template_config = self.training_templates.get(template_name)
+        if not template_config:
+            return
+        if self.apply_training_form_config(template_config):
+            self.template_combo.setCurrentText(template_name)
+
+    def maybe_confirm_template_before_training(self) -> Optional[dict]:
+        """训练前确认是否使用当前模板。"""
+        template_name = self.template_combo.currentText()
+        if template_name not in self.training_templates:
+            return self.collect_training_form_config()
+
+        message_box = QMessageBox(self)
+        message_box.setIcon(QMessageBox.Icon.Question)
+        message_box.setWindowTitle("使用训练模板")
+        message_box.setText(f"当前已选择训练模板“{template_name}”，本次训练是否使用该模板？")
+        use_template_button = message_box.addButton("使用模板", QMessageBox.ButtonRole.AcceptRole)
+        use_current_button = message_box.addButton("使用当前页面参数", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = message_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        message_box.setDefaultButton(use_template_button)
+        message_box.exec()
+
+        clicked = message_box.clickedButton()
+        if clicked == cancel_button:
+            return None
+        if clicked == use_current_button:
+            return self.collect_training_form_config()
+
+        template_config = self.training_templates.get(template_name)
+        if not template_config:
+            return self.collect_training_form_config()
+        if not self.apply_training_form_config(template_config):
+            return None
+        return self.collect_training_form_config()
+
+    def build_training_runtime_config(self, form_config: dict) -> Optional[dict]:
+        """将表单配置转换为训练线程使用的配置。"""
+        version = form_config.get('version')
+        model_size = form_config.get('model_size')
+        task = form_config.get('task')
+
+        if not version or version not in ULTRALYTICS_MODELS or not model_size or not task:
+            return None
+
+        return {
+            'version': version,
+            'model_prefix': ULTRALYTICS_MODELS[version]['prefix'],
+            'model_size': model_size,
+            'task': task,
+            'epochs': form_config['epochs'],
+            'batch_size': form_config['batch_size'],
+            'img_size': form_config['img_size'],
+            'lr': form_config['lr'],
+            'optimizer': form_config['optimizer'],
+            'device': form_config['device'],
+            'workers': form_config['workers'],
+            'mosaic': form_config['mosaic'],
+            'mixup': 0.1 if form_config['mixup'] else 0.0,
+            'flip': form_config['flip'],
+            'rotate': form_config['rotate'],
+            'hsv': form_config['hsv'],
+            'hsv_strength': form_config['hsv_strength'],
+            'train_split': form_config['train_split'],
+            'val_split': form_config['val_split'],
+            'test_split': form_config['test_split'],
+        }
     
     def create_monitor_panel(self) -> QWidget:
         """创建监控面板"""
@@ -1138,53 +1512,30 @@ class TrainPage(QWidget):
     
     def start_training(self):
         """开始训练"""
-        # 检查数据集划分
-        train = self.train_split.value()
-        val = self.val_split.value()
-        test = self.test_split.value()
-        
-        if train + val + test != 100:
-            QMessageBox.warning(self, "配置错误", "数据集划分比例总和必须等于100%")
-            return
-        
         # 检查是否选择了项目
         if not self.current_project_id:
             QMessageBox.warning(self, "错误", "请先选择一个项目")
             return
-        
-        # 获取模型配置
-        version = self.model_version.currentText()
-        model_size = self.model_size.currentData()
-        task = self.task_type.currentData()
-        
-        if not version or not model_size:
-            QMessageBox.warning(self, "错误", "请选择模型版本和型号")
+
+        form_config = self.maybe_confirm_template_before_training()
+        if form_config is None:
             return
-        
-        model_prefix = ULTRALYTICS_MODELS[version]['prefix']
-        
-        # 收集配置
-        config = {
-            'model_prefix': model_prefix,
-            'model_size': model_size,
-            'task': task,
-            'epochs': self.epochs.value(),
-            'batch_size': self.batch_size.value(),
-            'img_size': self.img_size.value(),
-            'lr': self.lr.value(),
-            'optimizer': self.optimizer.currentText(),
-            'device': self.device.currentText(),
-            'workers': self.workers.value(),
-            'mosaic': self.mosaic.isChecked(),
-            'mixup': 0.1 if self.mixup.isChecked() else 0.0,
-            'flip': self.flip.isChecked(),
-            'rotate': self.rotate.isChecked(),
-            'hsv': self.hsv.isChecked(),
-            'hsv_strength': self.hsv_strength.value(),
-            'train_split': train,
-            'val_split': val,
-            'test_split': test,
-        }
+
+        train = form_config['train_split']
+        val = form_config['val_split']
+        test = form_config['test_split']
+        if train + val + test != 100:
+            QMessageBox.warning(self, "配置错误", "数据集划分比例总和必须等于100%")
+            return
+
+        config = self.build_training_runtime_config(form_config)
+        if not config:
+            QMessageBox.warning(self, "错误", "请选择有效的模型版本和型号")
+            return
+
+        version = config['version']
+        model_size = config['model_size']
+        task = config['task']
         
         # 清空历史
         self.training_history = []
