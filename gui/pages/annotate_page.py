@@ -2534,19 +2534,19 @@ class AnnotatePage(QWidget):
         # 自动标注按钮
         self.btn_auto_label = QPushButton("🤖 自动标注")
         self.btn_auto_label.setMenu(self.create_auto_label_menu())
-        self.btn_auto_label.setStyleSheet(self._toolbar_chip_style('ai_blue'))
+        self.btn_auto_label.setStyleSheet(self._toolbar_menu_button_style('ai_blue'))
         
         # SAM自动标注按钮
         self.btn_sam = QPushButton("🎯 SAM")
         self.btn_sam.setToolTip("使用SAM进行交互式分割标注")
-        self.btn_sam.setStyleSheet(self._toolbar_chip_style('ai_green'))
+        self.btn_sam.setStyleSheet(self._toolbar_menu_button_style('ai_green'))
         self.apply_sam_button_mode()
         
         # LLM自动标注按钮
         self.btn_llm_label = QPushButton("🧠 LLM")
         self.btn_llm_label.setToolTip("使用多模态大模型进行自动标注")
         self.btn_llm_label.setMenu(self.create_llm_menu())
-        self.btn_llm_label.setStyleSheet(self._toolbar_chip_style('ai_gold'))
+        self.btn_llm_label.setStyleSheet(self._toolbar_menu_button_style('ai_gold'))
         
         # 批量处理按钮
         self.btn_batch_process = QPushButton("📋 批处理")
@@ -2663,6 +2663,26 @@ class AnnotatePage(QWidget):
             QToolButton::menu-button:hover {{
                 background-color: rgba(255, 255, 255, 0.14);
             }}
+            QToolButton::menu-arrow {{
+                width: 10px;
+                height: 10px;
+            }}
+            QToolButton::menu-indicator {{
+                width: 10px;
+                height: 10px;
+            }}
+        """
+
+    def _toolbar_menu_button_style(self, role: str) -> str:
+        """菜单按钮样式：保留下拉菜单能力，但隐藏倒三角指示器。"""
+        base_style = self._toolbar_chip_style(role)
+        return base_style + """
+            QPushButton::menu-indicator {
+                image: none;
+                width: 0px;
+                subcontrol-origin: padding;
+                subcontrol-position: right center;
+            }
         """
 
     def _get_toolbar_button_width(self, button) -> int:
