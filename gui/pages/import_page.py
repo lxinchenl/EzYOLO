@@ -708,6 +708,68 @@ class ImportPage(QWidget):
             self.loading_overlay.hide_loading()
             self.loading_overlay.deleteLater()
             delattr(self, 'loading_overlay')
+
+    def _build_image_list_item(self, image_data: Dict) -> QListWidgetItem:
+        """创建图片列表项（占位图标）"""
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, image_data['id'])
+        item.setText(image_data['filename'])
+        item.setToolTip(f"{image_data['filename']}\n{image_data.get('width', 0)}x{image_data.get('height', 0)}")
+
+        status = image_data.get('status', 'pending')
+        if status == 'annotated':
+            item.setBackground(QColor(COLORS['success']))
+
+        item.setSizeHint(QSize(180, 200))
+        return item
+
+    def _load_thumbnail_pixmap(self, storage_path: str) -> QPixmap:
+        """同步加载单张缩略图（用于增量追加）"""
+        pixmap = None
+        if storage_path and os.path.exists(storage_path):
+            try:
+                img = cv2.imread(storage_path)
+                if img is not None:
+                    img = cv2.resize(img, (160, 160))
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    h, w, ch = img.shape
+                    bytes_per_line = ch * w
+                    qt_image = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                    pixmap = QPixmap.fromImage(qt_image)
+            except Exception:
+                pass
+
+        if pixmap is None or pixmap.isNull():
+            pixmap = QPixmap(160, 160)
+            pixmap.fill(QColor(COLORS['sidebar']))
+        return pixmap
+
+    def _append_imported_images(self, before_image_ids: set) -> int:
+        """导入后仅增量追加新图片，返回追加数量"""
+        if not self.current_project_id:
+            return 0
+
+        latest_images = db.get_project_images(self.current_project_id)
+        new_images = [img for img in latest_images if img.get('id') not in before_image_ids]
+        if not new_images:
+            return 0
+
+        self.images.extend(new_images)
+
+        for image_data in new_images:
+            item = self._build_image_list_item(image_data)
+            self.image_list.addItem(item)
+
+            storage_path = image_data.get('storage_path', '')
+            pixmap = self.thumbnail_cache.get(storage_path)
+            if pixmap is None:
+                pixmap = self._load_thumbnail_pixmap(storage_path)
+                self.thumbnail_cache[storage_path] = pixmap
+            item.setIcon(QIcon(pixmap))
+
+        self.update_status_bar()
+        self.filter_images(self.view_combo.currentText())
+        return len(new_images)
     
     def filter_images(self, filter_text: str):
         """筛选图像"""
@@ -790,6 +852,8 @@ class ImportPage(QWidget):
         """处理视频导入"""
         if not self.current_project_id:
             return
+        
+        self._video_import_before_ids = {img.get('id') for img in self.images}
         
         from PyQt6.QtWidgets import QInputDialog
         interval, ok = QInputDialog.getInt(
@@ -1222,14 +1286,18 @@ class ImportPage(QWidget):
         try:
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(0)
+            before_ids = {img.get('id') for img in self.images}
             
             import_manager = ImportManager(self.current_project_id)
             imported, skipped = import_manager.import_folder(
                 folder_path,
                 progress_callback=self.update_import_progress
             )
-            
-            self.load_project_images()
+            if imported > 0:
+                appended = self._append_imported_images(before_ids)
+                if appended == 0:
+                    # 兜底：若无法识别新增项，回退全量重载
+                    self.load_project_images()
             
             QMessageBox.information(
                 self, "导入完成",
@@ -1249,14 +1317,18 @@ class ImportPage(QWidget):
         try:
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(0)
+            before_ids = {img.get('id') for img in self.images}
             
             import_manager = ImportManager(self.current_project_id)
             imported, skipped = import_manager.import_images(
                 file_paths,
                 progress_callback=self.update_import_progress
             )
-            
-            self.load_project_images()
+            if imported > 0:
+                appended = self._append_imported_images(before_ids)
+                if appended == 0:
+                    # 兜底：若无法识别新增项，回退全量重载
+                    self.load_project_images()
             
             QMessageBox.information(
                 self, "导入完成",
@@ -1278,8 +1350,15 @@ class ImportPage(QWidget):
         self.progress_bar.setVisible(False)
         
         if success:
-            # 重新加载项目图片
-            self.load_project_images()
+            before_ids = getattr(self, '_video_import_before_ids', None)
+            if imported > 0 and isinstance(before_ids, set):
+                appended = self._append_imported_images(before_ids)
+                if appended == 0:
+                    # 兜底：若无法识别新增项，回退全量重载
+                    self.load_project_images()
+            elif imported > 0:
+                # 未获取到导入前快照时，保持原有行为
+                self.load_project_images()
             
             # 显示成功消息
             QMessageBox.information(
@@ -1289,6 +1368,9 @@ class ImportPage(QWidget):
         else:
             # 显示错误消息
             QMessageBox.critical(self, "导入失败", message)
+
+        if hasattr(self, '_video_import_before_ids'):
+            delattr(self, '_video_import_before_ids')
     
     def clear_all_images(self):
         """清空所有图像"""
