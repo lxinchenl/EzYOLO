@@ -16,14 +16,16 @@ from models.database import db
 class AnnotationImporter:
     """标注导入器"""
     
-    def __init__(self, project_id: int):
+    def __init__(self, project_id: int, group_id: int = None):
         """
         初始化标注导入器
         
         Args:
             project_id: 项目ID
+            group_id: 新导入图片的默认分组
         """
         self.project_id = project_id
+        self.group_id = group_id
         self.project = db.get_project(project_id)
         if not self.project:
             raise ValueError(f"项目 {project_id} 不存在")
@@ -584,9 +586,17 @@ class AnnotationImporter:
         Returns:
             图像记录，失败返回None
         """
-        # 这里需要调用图像导入功能
-        # TODO: 实现图像导入逻辑
-        return None
+        from core.import_manager import ImportManager
+
+        path = Path(image_path)
+        if not path.is_file():
+            return None
+
+        import_manager = ImportManager(self.project_id, group_id=self.group_id)
+        if not import_manager.import_single_image(str(path)):
+            return None
+
+        return self._find_image_record(path.name)
     
     def _get_class_name_by_id(self, class_id: int) -> str:
         """

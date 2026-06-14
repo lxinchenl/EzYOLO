@@ -26,14 +26,16 @@ class ImportManager:
     # 支持的视频格式
     SUPPORTED_VIDEO_FORMATS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv'}
     
-    def __init__(self, project_id: int):
+    def __init__(self, project_id: int, group_id: int = None):
         """
         初始化导入管理器
         
         Args:
             project_id: 项目ID
+            group_id: 导入时默认放入的分组（None 表示未分组）
         """
         self.project_id = project_id
+        self.group_id = group_id
         self.project = db.get_project(project_id)
         if not self.project:
             raise ValueError(f"项目 {project_id} 不存在")
@@ -191,7 +193,8 @@ class ImportManager:
                 height=image_info['height'],
                 size=image_info['size'],
                 image_format=image_info['format'],
-                original_path=str(file_path)
+                original_path=str(file_path),
+                group_id=self.group_id,
             )
             
             return True
@@ -268,7 +271,8 @@ class ImportManager:
                             height=height,
                             size=size,
                             image_format='jpg',
-                            original_path=str(video_path)
+                            original_path=str(video_path),
+                            group_id=self.group_id,
                         )
                         
                         imported += 1

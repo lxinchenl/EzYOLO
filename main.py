@@ -22,8 +22,12 @@ def qt_message_handler(msg_type, context, message):
     if "QFont::setPointSize" in msg_str and "Point size <= 0" in msg_str:
         return  # 忽略这个警告
     
-    # 其他消息正常输出到stderr（Qt的默认行为）
-    if msg_type >= QtMsgType.QtWarningMsg:
+    # 其他消息正常输出到 stderr（Qt 的默认行为）
+    if msg_type in (
+        QtMsgType.QtWarningMsg,
+        QtMsgType.QtCriticalMsg,
+        QtMsgType.QtFatalMsg,
+    ):
         print(msg_str, file=sys.stderr)
 
 

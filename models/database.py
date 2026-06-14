@@ -167,7 +167,37 @@ class Database:
             )
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_training_jobs_project ON training_jobs(project_id)")
             
+            self._migrate_database(cursor)
+            
             conn.commit()
+
+    def _migrate_database(self, cursor):
+        """数据库结构迁移（兼容已有数据库）"""
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS image_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id, name)
+            )
+        """)
+
+        cursor.execute("PRAGMA table_info(images)")
+        image_columns = {row[1] for row in cursor.fetchall()}
+        if 'group_id' not in image_columns:
+            cursor.execute("""
+                ALTER TABLE images ADD COLUMN group_id INTEGER
+                REFERENCES image_groups(id) ON DELETE SET NULL
+            """)
+
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_images_group ON images(project_id, group_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_image_groups_project ON image_groups(project_id)"
+        )
     
     # ==================== 项目操作 ====================
     
@@ -258,33 +288,71 @@ class Database:
     def add_image(self, project_id: int, filename: str, storage_path: str,
                   width: int = None, height: int = None, size: int = None,
                   image_format: str = None, original_path: str = None,
-                  dataset_id: int = None) -> int:
+                  dataset_id: int = None, group_id: int = None) -> int:
         """添加图像记录"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO images 
-                (project_id, dataset_id, filename, original_path, storage_path, 
+                (project_id, dataset_id, group_id, filename, original_path, storage_path, 
                  width, height, size, format)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (project_id, dataset_id, filename, original_path, storage_path,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (project_id, dataset_id, group_id, filename, original_path, storage_path,
                   width, height, size, image_format))
             return cursor.lastrowid
     
-    def get_project_images(self, project_id: int, status: str = None) -> List[Dict]:
-        """获取项目下的所有图像"""
+    def get_project_images(self, project_id: int, status: str = None,
+                           group_id: int = None, ungrouped_only: bool = False) -> List[Dict]:
+        """获取项目下的所有图像
+
+        Args:
+            group_id: 指定分组 ID；与 ungrouped_only 互斥
+            ungrouped_only: 仅返回未分组图片（group_id IS NULL）
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            query = "SELECT * FROM images WHERE project_id = ?"
+            params: List[Any] = [project_id]
+
             if status:
-                cursor.execute(
-                    "SELECT * FROM images WHERE project_id = ? AND status = ? ORDER BY created_at",
-                    (project_id, status)
-                )
-            else:
-                cursor.execute(
-                    "SELECT * FROM images WHERE project_id = ? ORDER BY created_at",
-                    (project_id,)
-                )
+                query += " AND status = ?"
+                params.append(status)
+            if ungrouped_only:
+                query += " AND group_id IS NULL"
+            elif group_id is not None:
+                query += " AND group_id = ?"
+                params.append(group_id)
+
+            query += " ORDER BY created_at"
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_project_images_by_groups(self, project_id: int,
+                                     group_ids: List[int]) -> List[Dict]:
+        """按多个分组获取图片。group_ids 中 0 表示未分组（group_id IS NULL）。"""
+        if not group_ids:
+            return []
+
+        conditions = []
+        params: List[Any] = [project_id]
+        normal_ids = [gid for gid in group_ids if gid != 0]
+        include_ungrouped = 0 in group_ids
+
+        if normal_ids:
+            placeholders = ", ".join("?" * len(normal_ids))
+            conditions.append(f"group_id IN ({placeholders})")
+            params.extend(normal_ids)
+        if include_ungrouped:
+            conditions.append("group_id IS NULL")
+
+        where_clause = " OR ".join(conditions)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT * FROM images WHERE project_id = ? AND ({where_clause}) "
+                "ORDER BY created_at",
+                params
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     def get_project_images_by_class(self, project_id: int, class_id: int) -> List[Dict]:
@@ -389,6 +457,107 @@ class Database:
             )
             return cursor.rowcount > 0
     
+    def assign_images_to_group(self, image_ids: List[int],
+                               group_id: Optional[int] = None) -> int:
+        """批量设置图片分组。group_id=None 表示移出分组。"""
+        if not image_ids:
+            return 0
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            placeholders = ", ".join("?" * len(image_ids))
+            cursor.execute(
+                f"UPDATE images SET group_id = ? WHERE id IN ({placeholders})",
+                [group_id, *image_ids]
+            )
+            return cursor.rowcount
+
+    # ==================== 分组操作 ====================
+
+    def create_image_group(self, project_id: int, name: str) -> int:
+        """创建图片分组，同项目内名称不可重复。"""
+        name = name.strip()
+        if not name:
+            raise ValueError("分组名称不能为空")
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id FROM image_groups WHERE project_id = ? AND name = ?",
+                (project_id, name)
+            )
+            existing = cursor.fetchone()
+            if existing:
+                return existing['id']
+
+            cursor.execute(
+                "INSERT INTO image_groups (project_id, name) VALUES (?, ?)",
+                (project_id, name)
+            )
+            return cursor.lastrowid
+
+    def get_project_image_groups(self, project_id: int) -> List[Dict]:
+        """获取项目下所有分组。"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM image_groups WHERE project_id = ? ORDER BY name",
+                (project_id,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_image_group(self, group_id: int) -> Optional[Dict]:
+        """获取单个分组信息。"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM image_groups WHERE id = ?", (group_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def rename_image_group(self, group_id: int, name: str) -> bool:
+        """重命名分组。"""
+        name = name.strip()
+        if not name:
+            return False
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT project_id FROM image_groups WHERE id = ?", (group_id,))
+            row = cursor.fetchone()
+            if not row:
+                return False
+
+            cursor.execute(
+                "SELECT id FROM image_groups WHERE project_id = ? AND name = ? AND id != ?",
+                (row['project_id'], name, group_id)
+            )
+            if cursor.fetchone():
+                raise ValueError(f"分组名称“{name}”已存在")
+
+            cursor.execute(
+                "UPDATE image_groups SET name = ? WHERE id = ?",
+                (name, group_id)
+            )
+            return cursor.rowcount > 0
+
+    def delete_image_group(self, group_id: int) -> bool:
+        """删除分组，组内图片变为未分组。"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM image_groups WHERE id = ?", (group_id,))
+            return cursor.rowcount > 0
+
+    def get_group_image_counts(self, project_id: int) -> Dict[Optional[int], int]:
+        """统计各分组图片数量。键 None 表示未分组。"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT group_id, COUNT(*) AS cnt FROM images "
+                "WHERE project_id = ? GROUP BY group_id",
+                (project_id,)
+            )
+            return {row['group_id']: row['cnt'] for row in cursor.fetchall()}
+
     def delete_image(self, image_id: int) -> bool:
         """删除图像"""
         import os

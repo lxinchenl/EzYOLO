@@ -13,6 +13,10 @@ __pycache__/
 *.pyo
 *.pt
 
+# 本地测试脚本与数据集（不纳入版本库）
+test_yolo.py
+merged_dataset_v2/
+
 # IDE配置
 .vscode/
 .idea/

@@ -7,7 +7,8 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QGridLayout, QFrame, QFileDialog, QProgressBar,
-    QMenu, QMessageBox, QComboBox, QLineEdit, QListWidget, QListWidgetItem
+    QMenu, QMessageBox, QComboBox, QLineEdit, QListWidget, QListWidgetItem,
+    QDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont, QIcon
@@ -22,6 +23,7 @@ from models.database import db
 from core.import_manager import ImportManager
 from core.annotation_importer import AnnotationImporter
 from gui.widgets.loading_dialog import LoadingOverlay
+from gui.widgets.group_select_dialog import GroupSelectDialog, ask_import_group
 
 
 # 视频导入线程
@@ -30,17 +32,18 @@ class VideoImportThread(QThread):
     progress_updated = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str, int, int)
     
-    def __init__(self, video_path, project_id, frame_interval):
+    def __init__(self, video_path, project_id, frame_interval, group_id=None):
         super().__init__()
         self.video_path = video_path
         self.project_id = project_id
         self.frame_interval = frame_interval
+        self.group_id = group_id
     
     def run(self):
         """运行视频导入"""
         try:
             from core.import_manager import ImportManager
-            import_manager = ImportManager(self.project_id)
+            import_manager = ImportManager(self.project_id, group_id=self.group_id)
             
             def progress_callback(progress, message):
                 self.progress_updated.emit(progress, message)
@@ -127,6 +130,7 @@ class ImportPage(QWidget):
         self._image_load_generation = 0
         self.thumbnail_widgets = []  # 存储缩略图控件引用
         self.init_ui()
+        self.refresh_view_filter_options()
 
     def _remove_cached_thumbnails(self, storage_paths):
         """按路径移除缩略图缓存。"""
@@ -303,11 +307,16 @@ class ImportPage(QWidget):
         
         # 视图切换按钮
         self.view_combo = QComboBox()
-        self.view_combo.addItems(["全部", "未标注", "已标注"])
-        self.view_combo.setFixedWidth(100)
+        self.view_combo.setFixedWidth(160)
         self.view_combo.currentTextChanged.connect(self.filter_images)
         layout.addWidget(QLabel("筛选:"))
         layout.addWidget(self.view_combo)
+        
+        # 移动分组按钮
+        self.btn_move_group = QPushButton("📂 移动分组")
+        self.btn_move_group.setObjectName("secondary")
+        self.btn_move_group.clicked.connect(self.move_selected_to_group)
+        layout.addWidget(self.btn_move_group)
         
         # 删除选中按钮
         self.btn_delete_selected = QPushButton("🗑 删除选中")
@@ -390,6 +399,7 @@ class ImportPage(QWidget):
         if project_id:
             self.current_project_id = project_id
             self._update_refresh_button_state()
+            self.refresh_view_filter_options()
             self.load_project_images()
             # 更新任务类别显示
             self.update_task_type_display()
@@ -397,6 +407,7 @@ class ImportPage(QWidget):
             self.stop_image_loading()
             self.current_project_id = None
             self._update_refresh_button_state()
+            self.refresh_view_filter_options()
             self.image_list.clear()
             self.images = []
             self.thumbnail_widgets.clear()
@@ -785,7 +796,19 @@ class ImportPage(QWidget):
         item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, image_data['id'])
         item.setText(image_data['filename'])
-        item.setToolTip(f"{image_data['filename']}\n{image_data.get('width', 0)}x{image_data.get('height', 0)}")
+
+        group_id = image_data.get('group_id')
+        group_name = "未分组"
+        if group_id:
+            group = db.get_image_group(group_id)
+            if group:
+                group_name = group['name']
+
+        item.setToolTip(
+            f"{image_data['filename']}\n"
+            f"{image_data.get('width', 0)}x{image_data.get('height', 0)}\n"
+            f"分组: {group_name}"
+        )
 
         status = image_data.get('status', 'pending')
         if status == 'annotated':
@@ -842,9 +865,38 @@ class ImportPage(QWidget):
         self.filter_images(self.view_combo.currentText())
         return len(new_images)
 
+    def refresh_view_filter_options(self):
+        """刷新筛选下拉框（含分组列表）。"""
+        current_filter = self.view_combo.currentText() if hasattr(self, 'view_combo') else "全部"
+        self.view_combo.blockSignals(True)
+        self.view_combo.clear()
+        self.view_combo.addItem("全部", "all")
+        self.view_combo.addItem("未标注", "pending")
+        self.view_combo.addItem("已标注", "annotated")
+        self.view_combo.addItem("未分组", "ungrouped")
+
+        if self.current_project_id:
+            groups = db.get_project_image_groups(self.current_project_id)
+            counts = db.get_group_image_counts(self.current_project_id)
+            for group in groups:
+                count = counts.get(group['id'], 0)
+                label = f"分组: {group['name']} ({count})"
+                self.view_combo.addItem(label, group['id'])
+
+        restored = False
+        for i in range(self.view_combo.count()):
+            if self.view_combo.itemText(i) == current_filter:
+                self.view_combo.setCurrentIndex(i)
+                restored = True
+                break
+        if not restored:
+            self.view_combo.setCurrentIndex(0)
+        self.view_combo.blockSignals(False)
+
     
     def filter_images(self, filter_text: str):
         """筛选图像"""
+        filter_data = self.view_combo.currentData()
         for i in range(self.image_list.count()):
             item = self.image_list.item(i)
             image_id = item.data(Qt.ItemDataRole.UserRole)
@@ -854,13 +906,36 @@ class ImportPage(QWidget):
                 continue
             
             status = image_data.get('status', 'pending')
-            
-            if filter_text == "全部":
-                item.setHidden(False)
-            elif filter_text == "未标注":
-                item.setHidden(status != 'pending')
-            elif filter_text == "已标注":
-                item.setHidden(status == 'pending')
+            group_id = image_data.get('group_id')
+            visible = True
+
+            if filter_data == "all":
+                visible = True
+            elif filter_data == "pending":
+                visible = status == 'pending'
+            elif filter_data == "annotated":
+                visible = status == 'annotated'
+            elif filter_data == "ungrouped":
+                visible = group_id is None
+            elif isinstance(filter_data, int):
+                visible = group_id == filter_data
+            else:
+                if filter_text == "全部":
+                    visible = True
+                elif filter_text == "未标注":
+                    visible = status == 'pending'
+                elif filter_text == "已标注":
+                    visible = status == 'annotated'
+                elif filter_text == "未分组":
+                    visible = group_id is None
+                elif filter_text.startswith("分组:"):
+                    visible = False
+                    if group_id:
+                        group = db.get_image_group(group_id)
+                        if group and f"分组: {group['name']}" in filter_text:
+                            visible = True
+
+            item.setHidden(not visible)
     
     def on_image_clicked(self, item: QListWidgetItem):
         """图像点击事件"""
@@ -890,7 +965,10 @@ class ImportPage(QWidget):
         )
         
         if folder_path:
-            self.process_folder_import(folder_path)
+            proceed, group_id = ask_import_group(self, self.current_project_id)
+            if not proceed:
+                return
+            self.process_folder_import(folder_path, group_id=group_id)
     
     def import_images(self):
         """导入单张或多张图片"""
@@ -904,7 +982,10 @@ class ImportPage(QWidget):
         )
         
         if file_paths:
-            self.process_image_import(file_paths)
+            proceed, group_id = ask_import_group(self, self.current_project_id)
+            if not proceed:
+                return
+            self.process_image_import(file_paths, group_id=group_id)
     
     def import_video(self):
         """导入视频"""
@@ -918,9 +999,12 @@ class ImportPage(QWidget):
         )
         
         if file_path:
-            self.process_video_import(file_path)
+            proceed, group_id = ask_import_group(self, self.current_project_id)
+            if not proceed:
+                return
+            self.process_video_import(file_path, group_id=group_id)
     
-    def process_video_import(self, file_path: str):
+    def process_video_import(self, file_path: str, group_id: int = None):
         """处理视频导入"""
         if not self.current_project_id:
             return
@@ -945,7 +1029,8 @@ class ImportPage(QWidget):
         self.video_import_thread = VideoImportThread(
             file_path, 
             self.current_project_id, 
-            interval
+            interval,
+            group_id=group_id,
         )
         
         # 连接信号
@@ -1107,15 +1192,19 @@ class ImportPage(QWidget):
         
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+
+        proceed, group_id = ask_import_group(self, self.current_project_id)
+        if not proceed:
+            return
         
         if yolo_radio.isChecked():
-            self.import_yolo_annotations()
+            self.import_yolo_annotations(group_id=group_id)
         elif coco_radio.isChecked():
-            self.import_coco_annotations()
+            self.import_coco_annotations(group_id=group_id)
         elif voc_radio.isChecked():
-            self.import_voc_annotations()
+            self.import_voc_annotations(group_id=group_id)
     
-    def import_yolo_annotations(self):
+    def import_yolo_annotations(self, group_id: int = None):
         """导入YOLO标注"""
         labels_dir = QFileDialog.getExistingDirectory(
             self, "选择YOLO标签文件夹 (labels)", "",
@@ -1170,18 +1259,19 @@ class ImportPage(QWidget):
             
             finished = pyqtSignal(bool, str, int, int)
             
-            def __init__(self, project_id, labels_dir, images_dir, overwrite):
+            def __init__(self, project_id, labels_dir, images_dir, overwrite, group_id=None):
                 super().__init__()
                 self.project_id = project_id
                 self.labels_dir = labels_dir
                 self.images_dir = images_dir
                 self.overwrite = overwrite
+                self.group_id = group_id
             
             def run(self):
                 """运行导入"""
                 try:
                     from core.annotation_importer import AnnotationImporter
-                    importer = AnnotationImporter(self.project_id)
+                    importer = AnnotationImporter(self.project_id, group_id=self.group_id)
                     imported, skipped = importer.import_yolo_annotations(
                         self.labels_dir, self.images_dir, self.overwrite
                     )
@@ -1191,7 +1281,7 @@ class ImportPage(QWidget):
         
         # 创建并启动线程
         self.import_thread = AnnotationImportThread(
-            self.current_project_id, labels_dir, images_dir, overwrite
+            self.current_project_id, labels_dir, images_dir, overwrite, group_id=group_id
         )
         self.import_thread.finished.connect(self.on_annotation_import_finished)
         self.import_thread.start()
@@ -1206,6 +1296,7 @@ class ImportPage(QWidget):
         
         # 重新加载项目图片
         self.load_project_images()
+        self.refresh_view_filter_options()
         
         # 显示结果
         if success:
@@ -1216,7 +1307,7 @@ class ImportPage(QWidget):
         else:
             QMessageBox.critical(self, "导入失败", message)
     
-    def import_coco_annotations(self):
+    def import_coco_annotations(self, group_id: int = None):
         """导入COCO标注"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择COCO标注文件", "",
@@ -1258,17 +1349,18 @@ class ImportPage(QWidget):
             
             finished = pyqtSignal(bool, str, int, int)
             
-            def __init__(self, project_id, file_path, overwrite):
+            def __init__(self, project_id, file_path, overwrite, group_id=None):
                 super().__init__()
                 self.project_id = project_id
                 self.file_path = file_path
                 self.overwrite = overwrite
+                self.group_id = group_id
             
             def run(self):
                 """运行导入"""
                 try:
                     from core.annotation_importer import AnnotationImporter
-                    importer = AnnotationImporter(self.project_id)
+                    importer = AnnotationImporter(self.project_id, group_id=self.group_id)
                     imported, skipped = importer.import_coco_annotations(
                         self.file_path, self.overwrite
                     )
@@ -1278,12 +1370,12 @@ class ImportPage(QWidget):
         
         # 创建并启动线程
         self.import_thread = AnnotationImportThread(
-            self.current_project_id, file_path, overwrite
+            self.current_project_id, file_path, overwrite, group_id=group_id
         )
         self.import_thread.finished.connect(self.on_annotation_import_finished)
         self.import_thread.start()
     
-    def import_voc_annotations(self):
+    def import_voc_annotations(self, group_id: int = None):
         """导入VOC标注"""
         voc_dir = QFileDialog.getExistingDirectory(
             self, "选择VOC标注文件夹 (Annotations)", "",
@@ -1325,17 +1417,18 @@ class ImportPage(QWidget):
             
             finished = pyqtSignal(bool, str, int, int)
             
-            def __init__(self, project_id, voc_dir, overwrite):
+            def __init__(self, project_id, voc_dir, overwrite, group_id=None):
                 super().__init__()
                 self.project_id = project_id
                 self.voc_dir = voc_dir
                 self.overwrite = overwrite
+                self.group_id = group_id
             
             def run(self):
                 """运行导入"""
                 try:
                     from core.annotation_importer import AnnotationImporter
-                    importer = AnnotationImporter(self.project_id)
+                    importer = AnnotationImporter(self.project_id, group_id=self.group_id)
                     imported, skipped = importer.import_voc_annotations(
                         self.voc_dir, self.overwrite
                     )
@@ -1345,12 +1438,12 @@ class ImportPage(QWidget):
         
         # 创建并启动线程
         self.import_thread = AnnotationImportThread(
-            self.current_project_id, voc_dir, overwrite
+            self.current_project_id, voc_dir, overwrite, group_id=group_id
         )
         self.import_thread.finished.connect(self.on_annotation_import_finished)
         self.import_thread.start()
     
-    def process_folder_import(self, folder_path: str):
+    def process_folder_import(self, folder_path: str, group_id: int = None):
         """处理文件夹导入"""
         if not self.current_project_id:
             return
@@ -1360,7 +1453,7 @@ class ImportPage(QWidget):
             self.progress_bar.setValue(0)
             before_ids = {img.get('id') for img in self.images}
             
-            import_manager = ImportManager(self.current_project_id)
+            import_manager = ImportManager(self.current_project_id, group_id=group_id)
             imported, skipped = import_manager.import_folder(
                 folder_path,
                 progress_callback=self.update_import_progress
@@ -1375,13 +1468,14 @@ class ImportPage(QWidget):
                 self, "导入完成",
                 f"文件夹导入完成！\n成功导入: {imported} 张\n跳过: {skipped} 张"
             )
+            self.refresh_view_filter_options()
             
         except Exception as e:
             QMessageBox.critical(self, "导入失败", f"导入过程中发生错误:\n{str(e)}")
         finally:
             self.progress_bar.setVisible(False)
     
-    def process_image_import(self, file_paths: List[str]):
+    def process_image_import(self, file_paths: List[str], group_id: int = None):
         """处理图像导入"""
         if not self.current_project_id:
             return
@@ -1391,7 +1485,7 @@ class ImportPage(QWidget):
             self.progress_bar.setValue(0)
             before_ids = {img.get('id') for img in self.images}
             
-            import_manager = ImportManager(self.current_project_id)
+            import_manager = ImportManager(self.current_project_id, group_id=group_id)
             imported, skipped = import_manager.import_images(
                 file_paths,
                 progress_callback=self.update_import_progress
@@ -1406,6 +1500,7 @@ class ImportPage(QWidget):
                 self, "导入完成",
                 f"图片导入完成！\n成功导入: {imported} 张\n跳过: {skipped} 张"
             )
+            self.refresh_view_filter_options()
             
         except Exception as e:
             QMessageBox.critical(self, "导入失败", f"导入过程中发生错误:\n{str(e)}")
@@ -1437,6 +1532,7 @@ class ImportPage(QWidget):
                 self, "导入完成",
                 f"视频导入完成！\n成功导入: {imported} 帧\n跳过: {skipped} 帧"
             )
+            self.refresh_view_filter_options()
         else:
             # 显示错误消息
             QMessageBox.critical(self, "导入失败", message)
@@ -1485,6 +1581,57 @@ class ImportPage(QWidget):
             else:
                 QMessageBox.warning(self, "清空完成", f"成功删除 {deleted} 张，失败 {failed} 张")
     
+    def move_selected_to_group(self):
+        """将选中图片移动到指定分组"""
+        selected_items = self.image_list.selectedItems()
+        if not selected_items:
+            QMessageBox.information(self, "提示", "请先选择要移动的图片")
+            return
+        if not self.current_project_id:
+            return
+
+        dialog = GroupSelectDialog(
+            self,
+            self.current_project_id,
+            title="移动分组",
+            allow_ungroup=True,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.was_cancelled():
+            return
+
+        group_id = dialog.get_selected_group_id()
+        image_ids = [item.data(Qt.ItemDataRole.UserRole) for item in selected_items]
+        updated = db.assign_images_to_group(image_ids, group_id)
+
+        for image_id in image_ids:
+            image_data = next((img for img in self.images if img['id'] == image_id), None)
+            if image_data:
+                image_data['group_id'] = group_id
+
+        group_label = "未分组"
+        if group_id is not None:
+            group = db.get_image_group(group_id)
+            if group:
+                group_label = group['name']
+
+        for item in selected_items:
+            image_id = item.data(Qt.ItemDataRole.UserRole)
+            image_data = next((img for img in self.images if img['id'] == image_id), None)
+            if image_data:
+                item.setToolTip(
+                    f"{image_data['filename']}\n"
+                    f"{image_data.get('width', 0)}x{image_data.get('height', 0)}\n"
+                    f"分组: {group_label}"
+                )
+
+        self.refresh_view_filter_options()
+        self.filter_images(self.view_combo.currentText())
+
+        QMessageBox.information(
+            self, "移动完成",
+            f"已将 {updated} 张图片移动到「{group_label}」"
+        )
+
     def delete_selected_images(self):
         """删除选中的图片"""
         selected_items = self.image_list.selectedItems()

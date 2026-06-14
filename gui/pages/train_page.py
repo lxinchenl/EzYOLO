@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QSpinBox, QDoubleSpinBox, QGroupBox, QFormLayout,
     QCheckBox, QSlider, QProgressBar, QTextEdit, QSplitter,
     QTabWidget, QFileDialog, QMessageBox, QScrollArea, QFrame,
-    QInputDialog
+    QInputDialog, QRadioButton, QListWidget, QListWidgetItem, QButtonGroup,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings
 import os
@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 
 from gui.styles import COLORS
 from models.database import db
+
+UNGROUPED_GROUP_ID = 0
 
 # Matplotlib 导入
 import matplotlib
@@ -438,176 +440,235 @@ class TrainingThread(QThread):
             
             self.log_message.emit(f"准备数据集: 共 {len(images)} 张图片")
             
-            # 划分数据集
-            import random
-            random.seed(42)  # 保证可重复
-            random.shuffle(images)
+            split_mode = self.config.get('split_mode', 'random')
+            if split_mode == 'group':
+                train_group_ids = self.config.get('train_group_ids', [])
+                val_group_ids = self.config.get('val_group_ids', [])
+                test_group_ids = self.config.get('test_group_ids', [])
+
+                train_images = db.get_project_images_by_groups(self.project_id, train_group_ids)
+                val_images = db.get_project_images_by_groups(self.project_id, val_group_ids)
+                test_images = db.get_project_images_by_groups(self.project_id, test_group_ids)
+
+                if not train_images:
+                    self.log_message.emit("✗ 错误：训练集所选分组中没有图片")
+                    return None
+                if not val_images:
+                    self.log_message.emit("✗ 错误：验证集所选分组中没有图片")
+                    return None
+
+                used_ids = {img['id'] for img in train_images + val_images + test_images}
+                excluded = len(images) - len(used_ids)
+                if excluded > 0:
+                    self.log_message.emit(f"  - 未纳入训练的图片: {excluded} 张")
+            else:
+                # 划分数据集
+                import random
+                random.seed(42)  # 保证可重复
+                random.shuffle(images)
+                
+                total = len(images)
+                
+                # 获取分割比例
+                train_ratio = self.config.get('train_split', 80)
+                val_ratio = self.config.get('val_split', 10)
+                test_ratio = self.config.get('test_split', 10)
+                
+                # 计算数量，确保每个集合至少有一张图片
+                train_num = max(1, int(total * train_ratio / 100))
+                val_num = max(1, int(total * val_ratio / 100))
+                test_num = max(0, total - train_num - val_num)
+                
+                # 如果图片太少，调整分配
+                if total < 3:
+                    train_num = total
+                    val_num = 0
+                    test_num = 0
+                elif train_num + val_num > total:
+                    train_num = total - 1
+                    val_num = 1
+                    test_num = 0
+                
+                train_images = images[:train_num]
+                val_images = images[train_num:train_num + val_num]
+                test_images = images[train_num + val_num:]
             
-            total = len(images)
-            
-            # 获取分割比例
-            train_ratio = self.config.get('train_split', 80)
-            val_ratio = self.config.get('val_split', 10)
-            test_ratio = self.config.get('test_split', 10)
-            
-            # 计算数量，确保每个集合至少有一张图片
-            train_num = max(1, int(total * train_ratio / 100))
-            val_num = max(1, int(total * val_ratio / 100))
-            test_num = max(0, total - train_num - val_num)
-            
-            # 如果图片太少，调整分配
-            if total < 3:
-                train_num = total
-                val_num = 0
-                test_num = 0
-            elif train_num + val_num > total:
-                train_num = total - 1
-                val_num = 1
-                test_num = 0
-            
-            train_images = images[:train_num]
-            val_images = images[train_num:train_num + val_num]
-            test_images = images[train_num + val_num:]
-            
-            self.log_message.emit(f"  - 训练集: {len(train_images)} 张, 验证集: {len(val_images)} 张, 测试集: {len(test_images)} 张")
+            self.log_message.emit(
+                f"  - 训练集: {len(train_images)} 张, "
+                f"验证集: {len(val_images)} 张, 测试集: {len(test_images)} 张"
+            )
+
+            if isinstance(project, dict):
+                classes_json = project.get('classes', '[]')
+            else:
+                classes_json = project.classes if hasattr(project, 'classes') else '[]'
+            classes = json.loads(classes_json) if classes_json else []
+            class_names = [c['name'] for c in classes]
+            if not class_names:
+                self.log_message.emit("✗ 错误：项目未设置类别，请先在标注页添加任务类别")
+                return None
+            num_classes = len(class_names)
             
             # 复制图片和标注
             copied_count = {'train': 0, 'val': 0, 'test': 0}
             for split, img_list in [('train', train_images), ('val', val_images), ('test', test_images)]:
                 for img in img_list:
-                    # 复制图片
                     src_img = img.get('storage_path', '')
                     filename = img.get('filename', '')
-                    if src_img and os.path.exists(src_img):
-                        dst_img = f"{dataset_dir}/images/{split}/{filename}"
-                        try:
-                            shutil.copy2(src_img, dst_img)
-                            copied_count[split] += 1
-                        except Exception:
-                            pass
-                    
-                    # 复制标注
+                    if not (src_img and os.path.exists(src_img)):
+                        continue
+
+                    dst_img = f"{dataset_dir}/images/{split}/{filename}"
+                    try:
+                        shutil.copy2(src_img, dst_img)
+                        copied_count[split] += 1
+                    except Exception:
+                        continue
+
+                    label_file = (
+                        f"{dataset_dir}/labels/{split}/"
+                        f"{os.path.splitext(filename)[0]}.txt"
+                    )
                     annotations = db.get_image_annotations(img['id'])
-                    if annotations:
-                        label_file = f"{dataset_dir}/labels/{split}/{os.path.splitext(img['filename'])[0]}.txt"
-                        try:
-                            with open(label_file, 'w') as f:
-                                for ann in annotations:
-                                    ann_type = ann.get('type', 'unknown')
-                                    data = ann.get('data', {})
-                                    if not data:
-                                        continue
+                    try:
+                        with open(label_file, 'w', encoding='utf-8') as f:
+                            if not annotations:
+                                continue
+
+                            for ann in annotations:
+                                ann_type = ann.get('type', 'unknown')
+                                data = ann.get('data', {})
+                                if not data:
+                                    continue
+                                
+                                # 转换为YOLO格式 - 直接从img字典获取图片尺寸
+                                img_w = img.get('width', 640)
+                                img_h = img.get('height', 480)
+                                class_id = ann.get('class_id', 0)
+                                if class_id < 0 or class_id >= num_classes:
+                                    continue
+                                
+                                # 根据标注类型生成不同格式的标注
+                                if ann_type == 'bbox':
+                                    # 边界框标注
+                                    x = data.get('x', 0)
+                                    y = data.get('y', 0)
+                                    w = data.get('width', 0)
+                                    h = data.get('height', 0)
                                     
-                                    # 转换为YOLO格式 - 直接从img字典获取图片尺寸
-                                    img_w = img.get('width', 640)
-                                    img_h = img.get('height', 480)
-                                    class_id = ann.get('class_id', 0)
+                                    x_center = (x + w / 2) / img_w
+                                    y_center = (y + h / 2) / img_h
+                                    width = w / img_w
+                                    height = h / img_h
                                     
-                                    # 根据标注类型生成不同格式的标注
-                                    if ann_type == 'bbox':
-                                        # 边界框标注
-                                        x = data.get('x', 0)
-                                        y = data.get('y', 0)
-                                        w = data.get('width', 0)
-                                        h = data.get('height', 0)
-                                        
-                                        x_center = (x + w / 2) / img_w
-                                        y_center = (y + h / 2) / img_h
-                                        width = w / img_w
-                                        height = h / img_h
-                                        
-                                        line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n"
-                                        f.write(line)
-                                    elif ann_type == 'polygon':
-                                        # 多边形标注（用于segment任务）
-                                        points = data.get('points', [])
-                                        if points:
-                                            # 写入类别ID
-                                            line = f"{class_id} "
-                                            # 写入多边形点
-                                            for point in points:
-                                                px = point.get('x', 0) / img_w
-                                                py = point.get('y', 0) / img_h
-                                                line += f"{px:.6f} {py:.6f} "
-                                            line += "\n"
-                                            f.write(line)
-                                    elif ann_type == 'keypoint':
-                                        # 关键点标注（用于pose任务）
-                                        x = data.get('x', 0)
-                                        y = data.get('y', 0)
-                                        w = data.get('width', 0)
-                                        h = data.get('height', 0)
-                                        keypoints = data.get('keypoints', [])
-                                        
-                                        x_center = (x + w / 2) / img_w
-                                        y_center = (y + h / 2) / img_h
-                                        width = w / img_w
-                                        height = h / img_h
-                                        
-                                        # 写入边界框
-                                        line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} "
-                                        
-                                        # 写入关键点
-                                        for kp in keypoints:
-                                            kp_x = kp.get('x', 0) / img_w
-                                            kp_y = kp.get('y', 0) / img_h
-                                            kp_v = kp.get('v', 1)
-                                            line += f"{kp_x:.6f} {kp_y:.6f} {kp_v} "
+                                    line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n"
+                                    f.write(line)
+                                elif ann_type == 'polygon':
+                                    # 多边形标注（用于segment任务）
+                                    points = data.get('points', [])
+                                    if points:
+                                        line = f"{class_id} "
+                                        for point in points:
+                                            px = point.get('x', 0) / img_w
+                                            py = point.get('y', 0) / img_h
+                                            line += f"{px:.6f} {py:.6f} "
                                         line += "\n"
                                         f.write(line)
-                                    elif ann_type == 'obb':
-                                        # 旋转框标注（用于obb任务）
-                                        # 检查是否有八个角点的坐标
-                                        if 'points' in data and len(data['points']) == 4:
-                                            # 直接使用八个角点格式（x1 y1 x2 y2 x3 y3 x4 y4）
-                                            line = f"{class_id} "
-                                            for point in data['points']:
-                                                px = point.get('x', 0) / img_w
-                                                py = point.get('y', 0) / img_h
-                                                line += f"{px:.6f} {py:.6f} "
-                                            line += "\n"
-                                            f.write(line)
-                                        else:
-                                            # 如果没有八个角点坐标，使用默认的xywhr格式
-                                            x = data.get('x', 0)
-                                            y = data.get('y', 0)
-                                            w = data.get('width', 0)
-                                            h = data.get('height', 0)
-                                            angle = data.get('angle', 0)
-                                            
-                                            x_center = (x + w / 2) / img_w
-                                            y_center = (y + h / 2) / img_h
-                                            width = w / img_w
-                                            height = h / img_h
-                                            
-                                            line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} {angle:.6f}\n"
-                                            f.write(line)
-                        except Exception:
-                            pass
+                                elif ann_type == 'keypoint':
+                                    # 关键点标注（用于pose任务）
+                                    x = data.get('x', 0)
+                                    y = data.get('y', 0)
+                                    w = data.get('width', 0)
+                                    h = data.get('height', 0)
+                                    keypoints = data.get('keypoints', [])
+                                    
+                                    x_center = (x + w / 2) / img_w
+                                    y_center = (y + h / 2) / img_h
+                                    width = w / img_w
+                                    height = h / img_h
+                                    
+                                    line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} "
+                                    for kp in keypoints:
+                                        kp_x = kp.get('x', 0) / img_w
+                                        kp_y = kp.get('y', 0) / img_h
+                                        kp_v = kp.get('v', 1)
+                                        line += f"{kp_x:.6f} {kp_y:.6f} {kp_v} "
+                                    line += "\n"
+                                    f.write(line)
+                                elif ann_type == 'obb':
+                                    if 'points' in data and len(data['points']) == 4:
+                                        line = f"{class_id} "
+                                        for point in data['points']:
+                                            px = point.get('x', 0) / img_w
+                                            py = point.get('y', 0) / img_h
+                                            line += f"{px:.6f} {py:.6f} "
+                                        line += "\n"
+                                        f.write(line)
+                                    else:
+                                        x = data.get('x', 0)
+                                        y = data.get('y', 0)
+                                        w = data.get('width', 0)
+                                        h = data.get('height', 0)
+                                        angle = data.get('angle', 0)
+                                        
+                                        x_center = (x + w / 2) / img_w
+                                        y_center = (y + h / 2) / img_h
+                                        width = w / img_w
+                                        height = h / img_h
+                                        
+                                        line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} {angle:.6f}\n"
+                                        f.write(line)
+                    except Exception:
+                        pass
             
-            self.log_message.emit(f"  - 复制完成: 训练集 {copied_count['train']} 张, 验证集 {copied_count['val']} 张, 测试集 {copied_count['test']} 张")
+            self.log_message.emit(
+                f"  - 复制完成: 训练集 {copied_count['train']} 张, "
+                f"验证集 {copied_count['val']} 张, 测试集 {copied_count['test']} 张"
+            )
+
+            if copied_count['train'] == 0:
+                self.log_message.emit("✗ 错误：训练集未导出任何图片，请检查图片文件是否存在")
+                return None
+            if copied_count['val'] == 0:
+                self.log_message.emit("✗ 错误：验证集未导出任何图片，请检查图片文件是否存在")
+                return None
+
+            train_annotated = sum(
+                1 for img in train_images if db.get_image_annotations(img['id'])
+            )
+            val_annotated = sum(
+                1 for img in val_images if db.get_image_annotations(img['id'])
+            )
+            if train_annotated == 0:
+                self.log_message.emit("✗ 错误：训练集中没有已标注图片，请先完成标注")
+                return None
+            if val_annotated == 0:
+                self.log_message.emit("✗ 错误：验证集中没有已标注图片，请先完成标注")
+                return None
             
             # 创建data.yaml
-            if isinstance(project, dict):
-                classes_json = project.get('classes', '[]')
-            else:
-                classes_json = project.classes if hasattr(project, 'classes') else '[]'
+            dataset_path = os.path.abspath(dataset_dir).replace('\\', '/')
+            data_yaml_content = {
+                'path': dataset_path,
+                'train': 'images/train',
+                'val': 'images/val',
+                'nc': num_classes,
+                'names': class_names,
+            }
+            if copied_count['test'] > 0:
+                data_yaml_content['test'] = 'images/test'
             
-            classes = json.loads(classes_json) if classes_json else []
-            class_names = [c['name'] for c in classes]
-            
-            yaml_content = f"""path: {os.path.abspath(dataset_dir)}
-train: images/train
-val: images/val
-test: images/test
+            import yaml
 
-nc: {len(class_names)}
-names: {class_names}
-"""
-            
             yaml_path = f"{dataset_dir}/data.yaml"
-            with open(yaml_path, 'w') as f:
-                f.write(yaml_content)
+            with open(yaml_path, 'w', encoding='utf-8') as f:
+                yaml.dump(
+                    data_yaml_content,
+                    f,
+                    allow_unicode=True,
+                    default_flow_style=False,
+                    sort_keys=False,
+                )
             
             self.log_message.emit(f"✓ 数据集准备完成: {yaml_path}")
             return yaml_path
@@ -658,6 +719,8 @@ class TrainPage(QWidget):
                 print(f"[TrainPage] 已切换到项目: {project_name} (ID: {project_id})")
         else:
             print("[TrainPage] 项目已取消选择")
+        if hasattr(self, 'refresh_split_group_lists'):
+            self.refresh_split_group_lists()
     
     def init_ui(self):
         """初始化界面"""
@@ -967,8 +1030,24 @@ class TrainPage(QWidget):
         group = QGroupBox("数据集划分")
         group.setStyleSheet(self.get_group_style())
         
-        layout = QFormLayout(group)
+        layout = QVBoxLayout(group)
         layout.setSpacing(10)
+
+        mode_row = QHBoxLayout()
+        self.split_mode_group = QButtonGroup(self)
+        self.split_mode_random = QRadioButton("按比例随机划分")
+        self.split_mode_groups = QRadioButton("按分组指定")
+        self.split_mode_random.setChecked(True)
+        self.split_mode_group.addButton(self.split_mode_random, 0)
+        self.split_mode_group.addButton(self.split_mode_groups, 1)
+        mode_row.addWidget(self.split_mode_random)
+        mode_row.addWidget(self.split_mode_groups)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
+        self.ratio_split_widget = QWidget()
+        ratio_layout = QFormLayout(self.ratio_split_widget)
+        ratio_layout.setSpacing(10)
         
         # 训练集比例
         self.train_split = NoWheelSlider(Qt.Orientation.Horizontal)
@@ -979,7 +1058,7 @@ class TrainPage(QWidget):
         split_layout = QHBoxLayout()
         split_layout.addWidget(self.train_split)
         split_layout.addWidget(self.train_label)
-        layout.addRow("训练集:", split_layout)
+        ratio_layout.addRow("训练集:", split_layout)
         
         # 验证集比例
         self.val_split = NoWheelSlider(Qt.Orientation.Horizontal)
@@ -990,7 +1069,7 @@ class TrainPage(QWidget):
         split_layout = QHBoxLayout()
         split_layout.addWidget(self.val_split)
         split_layout.addWidget(self.val_label)
-        layout.addRow("验证集:", split_layout)
+        ratio_layout.addRow("验证集:", split_layout)
         
         # 测试集比例
         self.test_split = NoWheelSlider(Qt.Orientation.Horizontal)
@@ -1001,14 +1080,147 @@ class TrainPage(QWidget):
         split_layout = QHBoxLayout()
         split_layout.addWidget(self.test_split)
         split_layout.addWidget(self.test_label)
-        layout.addRow("测试集:", split_layout)
+        ratio_layout.addRow("测试集:", split_layout)
         
         # 总和提示
         self.split_warning = QLabel("")
         self.split_warning.setStyleSheet(f"color: {COLORS['error']}; font-size: 12px;")
-        layout.addRow(self.split_warning)
-        
+        ratio_layout.addRow(self.split_warning)
+        layout.addWidget(self.ratio_split_widget)
+
+        self.group_split_widget = QWidget()
+        group_layout = QFormLayout(self.group_split_widget)
+        group_layout.setSpacing(8)
+
+        hint = QLabel("为训练/验证/测试集分别勾选分组（可多选）。未勾选的图片不会参与训练。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        group_layout.addRow(hint)
+
+        self.train_group_list = self._create_group_check_list()
+        self.val_group_list = self._create_group_check_list()
+        self.test_group_list = self._create_group_check_list()
+        group_layout.addRow("训练集分组:", self.train_group_list)
+        group_layout.addRow("验证集分组:", self.val_group_list)
+        group_layout.addRow("测试集分组:", self.test_group_list)
+
+        self.group_split_warning = QLabel("")
+        self.group_split_warning.setStyleSheet(f"color: {COLORS['error']}; font-size: 12px;")
+        group_layout.addRow(self.group_split_warning)
+
+        self.group_split_widget.setVisible(False)
+        layout.addWidget(self.group_split_widget)
+
+        self.split_mode_random.toggled.connect(self._on_split_mode_changed)
+        self.split_mode_groups.toggled.connect(self._on_split_mode_changed)
+        self.refresh_split_group_lists()
+
         return group
+
+    def _create_group_check_list(self) -> QListWidget:
+        widget = QListWidget()
+        widget.setMaximumHeight(110)
+        widget.setStyleSheet(f"""
+            QListWidget {{
+                background-color: {COLORS['sidebar']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+            }}
+            QListWidget::item {{
+                color: {COLORS['text_primary']};
+                padding: 2px 4px;
+            }}
+        """)
+        return widget
+
+    def _on_split_mode_changed(self):
+        use_groups = self.split_mode_groups.isChecked()
+        self.ratio_split_widget.setVisible(not use_groups)
+        self.group_split_widget.setVisible(use_groups)
+        if use_groups:
+            self.refresh_split_group_lists()
+
+    def refresh_split_group_lists(self):
+        """刷新按分组划分时的分组列表。"""
+        if not hasattr(self, 'train_group_list'):
+            return
+
+        counts = {}
+        groups = []
+        if self.current_project_id:
+            groups = db.get_project_image_groups(self.current_project_id)
+            counts = db.get_group_image_counts(self.current_project_id)
+
+        selected = {
+            'train': self._get_checked_group_ids(self.train_group_list),
+            'val': self._get_checked_group_ids(self.val_group_list),
+            'test': self._get_checked_group_ids(self.test_group_list),
+        }
+
+        for widget, key in (
+            (self.train_group_list, 'train'),
+            (self.val_group_list, 'val'),
+            (self.test_group_list, 'test'),
+        ):
+            widget.blockSignals(True)
+            widget.clear()
+            ungrouped_count = counts.get(None, 0)
+            item = QListWidgetItem(f"未分组 ({ungrouped_count})")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setData(Qt.ItemDataRole.UserRole, UNGROUPED_GROUP_ID)
+            item.setCheckState(
+                Qt.CheckState.Checked if UNGROUPED_GROUP_ID in selected[key]
+                else Qt.CheckState.Unchecked
+            )
+            widget.addItem(item)
+
+            for group in groups:
+                count = counts.get(group['id'], 0)
+                item = QListWidgetItem(f"{group['name']} ({count})")
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setData(Qt.ItemDataRole.UserRole, group['id'])
+                item.setCheckState(
+                    Qt.CheckState.Checked if group['id'] in selected[key]
+                    else Qt.CheckState.Unchecked
+                )
+                widget.addItem(item)
+            widget.blockSignals(False)
+
+    def _get_checked_group_ids(self, widget: QListWidget) -> List[int]:
+        group_ids = []
+        for i in range(widget.count()):
+            item = widget.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                group_ids.append(item.data(Qt.ItemDataRole.UserRole))
+        return group_ids
+
+    def _validate_group_split_selection(self) -> Optional[str]:
+        train_ids = self._get_checked_group_ids(self.train_group_list)
+        val_ids = self._get_checked_group_ids(self.val_group_list)
+        test_ids = self._get_checked_group_ids(self.test_group_list)
+
+        if not train_ids:
+            return "请为训练集至少选择一个分组"
+        if not val_ids:
+            return "请为验证集至少选择一个分组"
+
+        for name_a, name_b, ids_a, ids_b in (
+            ("训练集", "验证集", train_ids, val_ids),
+            ("训练集", "测试集", train_ids, test_ids),
+        ):
+            overlap = set(ids_a) & set(ids_b)
+            if overlap:
+                return f"{name_a}与{name_b}选择了重复的分组，请调整"
+
+        if self.current_project_id:
+            train_count = len(db.get_project_images_by_groups(self.current_project_id, train_ids))
+            val_count = len(db.get_project_images_by_groups(self.current_project_id, val_ids))
+            if train_count == 0:
+                return "训练集所选分组中没有图片"
+            if val_count == 0:
+                return "验证集所选分组中没有图片"
+
+        return None
     
     def on_split_changed(self):
         """数据集划分改变"""
@@ -1155,6 +1367,10 @@ class TrainPage(QWidget):
             'train_split': self.train_split.value(),
             'val_split': self.val_split.value(),
             'test_split': self.test_split.value(),
+            'split_mode': 'group' if self.split_mode_groups.isChecked() else 'random',
+            'train_group_ids': self._get_checked_group_ids(self.train_group_list),
+            'val_group_ids': self._get_checked_group_ids(self.val_group_list),
+            'test_group_ids': self._get_checked_group_ids(self.test_group_list),
         }
 
     def _set_combo_by_text(self, combo: QComboBox, value: str) -> bool:
@@ -1211,6 +1427,29 @@ class TrainPage(QWidget):
         self.val_split.setValue(int(config.get('val_split', self.val_split.value())))
         self.test_split.setValue(int(config.get('test_split', self.test_split.value())))
         self.on_split_changed()
+
+        split_mode = config.get('split_mode', 'random')
+        if split_mode == 'group':
+            self.split_mode_groups.setChecked(True)
+        else:
+            self.split_mode_random.setChecked(True)
+        self._on_split_mode_changed()
+        self.refresh_split_group_lists()
+
+        def _apply_checks(widget: QListWidget, group_ids: List[int]):
+            if group_ids is None:
+                return
+            selected = set(group_ids)
+            for i in range(widget.count()):
+                item = widget.item(i)
+                gid = item.data(Qt.ItemDataRole.UserRole)
+                item.setCheckState(
+                    Qt.CheckState.Checked if gid in selected else Qt.CheckState.Unchecked
+                )
+
+        _apply_checks(self.train_group_list, config.get('train_group_ids'))
+        _apply_checks(self.val_group_list, config.get('val_group_ids'))
+        _apply_checks(self.test_group_list, config.get('test_group_ids'))
         return True
 
     def save_current_as_template(self):
@@ -1346,6 +1585,10 @@ class TrainPage(QWidget):
             'train_split': form_config['train_split'],
             'val_split': form_config['val_split'],
             'test_split': form_config['test_split'],
+            'split_mode': form_config.get('split_mode', 'random'),
+            'train_group_ids': form_config.get('train_group_ids', []),
+            'val_group_ids': form_config.get('val_group_ids', []),
+            'test_group_ids': form_config.get('test_group_ids', []),
         }
     
     def create_monitor_panel(self) -> QWidget:
@@ -1521,12 +1764,29 @@ class TrainPage(QWidget):
         if form_config is None:
             return
 
-        train = form_config['train_split']
-        val = form_config['val_split']
-        test = form_config['test_split']
-        if train + val + test != 100:
-            QMessageBox.warning(self, "配置错误", "数据集划分比例总和必须等于100%")
-            return
+        split_mode = form_config.get('split_mode', 'random')
+        if split_mode == 'group':
+            error = self._validate_group_split_selection()
+            if error:
+                QMessageBox.warning(self, "配置错误", error)
+                return
+        else:
+            train = form_config['train_split']
+            val = form_config['val_split']
+            test = form_config['test_split']
+            if train + val + test != 100:
+                QMessageBox.warning(self, "配置错误", "数据集划分比例总和必须等于100%")
+                return
+
+        project = db.get_project(self.current_project_id)
+        if project:
+            classes = json.loads(project.get('classes') or '[]')
+            if not classes:
+                QMessageBox.warning(
+                    self, "配置错误",
+                    "项目未设置类别，请先在标注页添加任务类别后再训练"
+                )
+                return
 
         config = self.build_training_runtime_config(form_config)
         if not config:

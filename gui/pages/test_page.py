@@ -24,6 +24,8 @@ from typing import Dict, List, Optional, Tuple
 from gui.styles import COLORS
 from models.database import db
 
+UNGROUPED_GROUP_ID = 0
+
 # 从train_page导入模型配置
 from gui.pages.train_page import ULTRALYTICS_MODELS, TASK_NAMES, SIZE_NAMES
 
@@ -745,9 +747,11 @@ class TestPage(QWidget):
                 print(f"[TestPage] 已切换到项目: {project_name} (ID: {project_id})")
                 # 自动设置默认模型路径
                 self.set_default_model_path()
+                self.refresh_data_group_combo()
         else:
             self.current_project = None
             print("[TestPage] 项目已取消选择")
+            self.refresh_data_group_combo()
     
     def set_default_model_path(self):
         """设置默认模型路径（项目训练文件夹中的best.pt）"""
@@ -787,6 +791,7 @@ class TestPage(QWidget):
         splitter.setSizes([400, 800])
         
         main_layout.addWidget(splitter)
+        self.refresh_data_group_combo()
     
     def create_config_panel(self) -> QWidget:
         """创建配置面板"""
@@ -1237,6 +1242,17 @@ class TestPage(QWidget):
         self.data_count_label = QLabel("已加载: 0 个文件")
         self.data_count_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
         layout.addWidget(self.data_count_label)
+
+        # 项目分组加载
+        group_row = QHBoxLayout()
+        group_row.addWidget(QLabel("项目分组:"))
+        self.group_combo = QComboBox()
+        self.group_combo.setMinimumWidth(140)
+        group_row.addWidget(self.group_combo, 1)
+        self.btn_load_group = QPushButton("📂 加载分组")
+        self.btn_load_group.clicked.connect(self.load_project_group)
+        group_row.addWidget(self.btn_load_group)
+        layout.addLayout(group_row)
         
         # 按钮布局
         btn_layout = QHBoxLayout()
@@ -1522,6 +1538,83 @@ class TestPage(QWidget):
         
         # 更新数据列表显示
         self.update_data_list()
+
+    def refresh_data_group_combo(self):
+        """刷新项目分组下拉列表。"""
+        if not hasattr(self, 'group_combo'):
+            return
+
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+
+        if not self.current_project_id:
+            self.group_combo.addItem("请先选择项目", None)
+            self.group_combo.setEnabled(False)
+            self.btn_load_group.setEnabled(False)
+            self.group_combo.blockSignals(False)
+            return
+
+        counts = db.get_group_image_counts(self.current_project_id)
+        groups = db.get_project_image_groups(self.current_project_id)
+
+        ungrouped_count = counts.get(None, 0)
+        self.group_combo.addItem(f"未分组 ({ungrouped_count})", UNGROUPED_GROUP_ID)
+        for group in groups:
+            count = counts.get(group['id'], 0)
+            self.group_combo.addItem(f"{group['name']} ({count})", group['id'])
+
+        has_groups = self.group_combo.count() > 0
+        self.group_combo.setEnabled(has_groups)
+        self.btn_load_group.setEnabled(has_groups)
+        self.group_combo.blockSignals(False)
+
+    def load_project_group(self):
+        """从当前项目分组加载图片。"""
+        if not self.current_project_id:
+            QMessageBox.warning(self, "提示", "请先选择项目")
+            return
+
+        group_id = self.group_combo.currentData()
+        if group_id is None:
+            QMessageBox.warning(self, "提示", "请先选择项目")
+            return
+
+        if group_id == UNGROUPED_GROUP_ID:
+            images = db.get_project_images(self.current_project_id, ungrouped_only=True)
+            group_label = "未分组"
+        else:
+            images = db.get_project_images(self.current_project_id, group_id=group_id)
+            group = db.get_image_group(group_id)
+            group_label = group['name'] if group else str(group_id)
+
+        if not images:
+            QMessageBox.information(self, "提示", f"分组「{group_label}」中没有图片")
+            return
+
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
+        added = 0
+        skipped = 0
+        existing = set(self.data_paths)
+
+        for image in images:
+            storage_path = image.get('storage_path', '')
+            if not storage_path or not os.path.exists(storage_path):
+                skipped += 1
+                continue
+            if Path(storage_path).suffix.lower() not in image_extensions:
+                skipped += 1
+                continue
+            if storage_path in existing:
+                skipped += 1
+                continue
+            self.data_paths.append(storage_path)
+            existing.add(storage_path)
+            added += 1
+
+        self.update_data_list()
+        self.log_message(f"已从分组「{group_label}」加载 {added} 张图片")
+        if skipped > 0:
+            self.log_message(f"  跳过 {skipped} 个（不存在、非图片或已加载）")
     
     def update_data_list(self):
         """更新数据列表显示"""
